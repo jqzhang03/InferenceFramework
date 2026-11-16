@@ -12,6 +12,16 @@ All source code lives under `nanovllm/`:
 
 Root-level `example.py` and `bench.py` are runnable demos; `assets/` holds images; `pyproject.toml` defines packaging and dependencies. `benchmarks/` holds the performance tooling (see `INTERVIEW.md` §10 基准档案): `bench.py` (throughput/latency/SLO/vLLM comparison), `context_concurrency.py` (concurrency × context-length sweep and live KV capacity budget), `kv_fp8_calibrate.py` (real-text FP8 KV calibration and held-out precision comparison), `scheduling_ablation.py` (continuous arrivals, scheduler-policy ablations, and prefix/deferred-free lifecycle counters), `admission_ablation.py` (online accept/defer/reject comparison across admission-off, cache-blind, and cache-aware variants), `compare_quantization.py` (paired INT4/NVFP4 arrival-trace comparison), `prefix_cache_probe.py` / `prefix_cache_verify.py` / `prefix_estimate_check.py` (prefix-hit estimate vs committed reuse, in-process and over HTTP), `profiler.py` (torch.profiler prefill/decode breakdown), plus dev scripts to drive runs from Windows into WSL. Tests live under `tests/`; the pure-Python portions do not need a GPU. `test_nvfp4.py` covers E2M1 packing, both scale layouts, software/native CUDA GEMMs, and empty MoE expert batches; `test_quantization_comparison.py` checks paired workload validation; `test_prefix_feature_lifecycle.py` covers generation invalidation, cache allocation/eviction, swap release, deferred-free commit, and metric reset boundaries; `test_prefix_estimate.py` covers the cross-thread snapshot estimate, version-based staleness, and `pending_free` exclusion; `test_decode_burst_yield.py` covers the burst return contract and the arrival-pressure predicate; `test_tpot_throttle.py` covers per-request metric idempotency and the TPOT throttle deadband/queue gate.
 
+`benchmarks/nsys_profile.py` emits an NVTX-annotated eager inference trace and a per-module
+current-stream CUDA Event elapsed-time summary for Nsight Systems. Use TP=1 and focus the UI on
+`nsys_capture`. Detailed layer ranges cover Qwen3 and DeepSeek-V2 (MLA, dense/MoE MLP, and
+shared experts). For DeepSeek-V2-Lite on a 16 GB GPU, use INT4 group size 64 with streaming
+load. The WSL 2024.6.2 CLI produced an NVTX-only report; the upgraded 2026.5.1 CLI
+captured CUDA API, kernel, and memory events with ordinary full-process capture on this machine.
+An NVTX-triggered capture attempt produced no report, so omit `--capture-range`. Event times can
+include stream idle gaps and nested module ranges overlap; use the Nsight kernel timeline for
+kernel-active durations.
+
 `benchmarks/compare_ablation.py` compares scheduling/admission reports only when their exact
 prompt, sampling, arrival-time, seed, and SLO workload fingerprints match. Admission reports
 include joint TTFT/TPOT SLO request and output-token goodput.
@@ -63,6 +73,8 @@ python benchmarks/bench.py --num-seqs 256 --shared-prefix-len 512   # prefix-cac
 python benchmarks/context_concurrency.py --context-lengths 512,1024,2048,4096 --concurrency 1,2,4,8,16 --repeats 3
 python benchmarks/kv_fp8_calibrate.py --calibration-file calibration.jsonl --eval-file heldout.jsonl --output results/kv_eval.json
 python benchmarks/profiler.py --num-seqs 64 --max-input-len 512 --max-output-len 64  # prefill/decode breakdown
+mkdir -p profiles  # ignored report directory required before nsys starts
+PYTHONPATH=. /usr/local/bin/nsys profile --force-overwrite=true --trace=cuda,nvtx,osrt,cublas --stats=true --sample=none --cpuctxsw=none -o profiles/qwen3_0.6b_nsys python benchmarks/nsys_profile.py --num-seqs 8 --min-input-len 512 --max-input-len 512 --min-output-len 32 --max-output-len 32 --gpu-event-json profiles/qwen3_0.6b_nsys_gpu_events.json  # WSL2 NVTX + CUDA Event summary
 python benchmarks/scheduling_ablation.py --num-seqs 128 --arrival-rate 16 --arrival-mode poisson
 python benchmarks/moe_int4_ablation.py ~/huggingface/DeepSeek-V2-Lite --int4-group-size 64 --token-batches 1,8,32
 python benchmarks/moe_int4_fixed_shape_diag.py ~/huggingface/DeepSeek-V2-Lite --num-seqs 24 --input-length 64 --seeds 7,17,42 --temperatures 0.6,0.8,1.0 --output-lengths 64,128 --repeats 3 --warmup-repeats 2 --output results/moe_int4_fixed_shape_diag_20261012.json
@@ -164,6 +176,77 @@ git_worktree_dirty=true; raw JSON/CSV are local ignored artifacts under results/
 See INTERVIEW.md §10.3.20 and benchmarks/_supplemental_report_20261016.md.
 supplemental_report.py appends tracked 2026 dated follow-up Markdown files after the generated
 2026-10-15 body, so regeneration retains this historical update.
+
+### Standalone CUDA GEMM operator
+
+`benchmarks/cuda_gemm.cu` and `cuda_gemm_bench.py` implement and validate independent
+FP16/BF16 row-major GEMM (FP32 accumulation); they do not change engine dispatch.
+The SM80+ fast path uses MMA, ldmatrix, XOR-swizzled shared memory, and cp.async.
+N/K must be divisible by 8 for the fast path; other sizes use a scalar fallback.
+Inputs must be contiguous and 16-byte aligned. Kernels use the current CUDA stream;
+CUDA Graph capture and boundary cases are checked by `--check-only`.
+The baseline calls cuBLAS GemmEx directly, with reduced-precision reduction disabled.
+Use `python -m benchmarks.cuda_gemm_bench` to tune; freeze configs with
+`--tuning-report` for independent validation seeds. `cuda_gemm_report.py` checks
+report compatibility and generates `benchmarks/_cuda_gemm_report_20261115.md`.
+Keep its warm-cache operator results separate from serving throughput and the
+historical 2026-10-05 FP16 experiment. Tested GPU: RTX 5060 Ti / SM120 only.
+
+`cuda_gemm_profile.py` adds controlled K/grid/residency/stage/layout experiments
+and Nsight Systems SQLite analysis; `cuda_gemm_profile_report.py` renders the
+dated attribution report. CUDA `gemm_out_smem`, `kernel_info`,
+`gemm_diagnostic_out`, `diagnostic_info`, and `launch_empty` are diagnostic APIs.
+They preserve the 21 normal config IDs/default address layout. Reserved unused
+shared memory limits residency while retaining the same kernel instructions;
+the alternative A swizzle remains diagnostic. Occupancy API values are static
+limits, not measured achieved occupancy. Nsight Compute 2025.1.1 failed with
+`LibraryNotLoaded`; the same-day recovery selected the existing Linux CLI
+2026.3.1 bundled under `/mnt/d/NsightCompute/target/linux-desktop-glibc_2_11_3-x64/`.
+`cuda_gemm_profile.py` now selects the newest discovered Linux ncu, with
+`--ncu` / `NCU_BIN` overrides. `ncu_diagnose.py` isolates failures with a standalone
+CUDA probe (`NCU_PROBE_CXX` overrides this machine's GCC 13 default). Versioned
+report directories retain failed historical attempts; successful runs export raw
+CSV and command/status JSON. See `benchmarks/_ncu_recovery_20261115.md`.
+Nsight Systems 2026.5.1 kernel tracing succeeded. Never label
+the algebraic K/MN shape-effect decomposition as hardware stall percentages.
+
+`cuda_gemm_counter_study.py` reruns randomized paired graph timings and serial
+Nsight Compute captures for both backends, dtypes and sizes; run it through
+`bash benchmarks/run_cuda_gemm.sh --counter-study`. Primary counters have three
+independent captures; fixed-cfg10 rectangular K/grid/wave controls have one per
+point and separately repeated unprofiled timings. `cuda_gemm_counter_report.py`
+renders `benchmarks/_cuda_gemm_counter_20261116.md`. Trace/counter `--shape M N K`
+overrides `--size` and validates outputs before profiling. Detailed memory tables
+are included. Preserve raw CSV units: duration units can change with shape, and
+warp-state ratios are cycles/instruction, not percentages of runtime. Lower
+occupancy alone is not a diagnosis: FP16 cuBLAS has lower achieved occupancy but
+higher Tensor activity at 1024. Keep the new counter evidence separate from the
+historical 2026-11-15 attribution and recovery datasets.
+
+### Standalone native FP8 GEMM
+
+`benchmarks/cuda_fp8_gemm.cu` / `cuda_fp8_gemm_bench.py` implement native SM120a
+warp FP8 MMA with FP32 accumulation and BF16 output. The contract is contiguous
+`A[M,K]`, prepacked `W[N,K]`, `C[M,N]`, with finite scalar alpha, 16-byte-aligned
+inputs and K divisible by 16. Custom kernels handle partial M/N/K tiles, empty
+outputs and K=0. Other K alignment is rejected. E4M3 is benchmarked; native E5M2
+correctness is tested separately without a cuBLASLt E5M2 performance claim.
+The 28 configs cover tile/warp/stage variants and optional M-group-8 CTA raster
+for L2 weight reuse. SASS must contain FP8 `QMMA`, `LDSM` and `LDGSTS`; no BF16
+dequantization GEMM or engine integration is involved.
+
+The cuBLASLt plan owns layouts/algorithms/workspace (up to 32 MiB), uses
+COMPUTE_32F / FAST_ACCUM=0, and tunes a heuristic subset outside validation.
+Algorithm attributes are frozen and checked across seeds. Both paths receive
+the same packed inputs and output type. Quantization/transpose/allocation/setup
+are excluded; report decoded-input arithmetic error separately from FP8
+quantization error. Do not claim end-model quality or serving speedup.
+Use the WSL helper `--fp8`, `--fp8-pytest`, `--fp8-ablation`, `--fp8-profile`;
+`cuda_fp8_gemm_report.py` renders the dated report. `--tuning-report` freezes
+both selectors; `--shapes` accepts semicolon or plus-separated M,N,K triples.
+Compile explicitly for sm_120a with CUDA 12.8+ and the helper's GCC 13 default.
+See `benchmarks/_cuda_fp8_gemm_20261116.md`; preserve initial and grouped runs
+as separate observations. Original FP16/BF16 files and 21 config IDs are unchanged.
 
 ## Documentation maintenance
 

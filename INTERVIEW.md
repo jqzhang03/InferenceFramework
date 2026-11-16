@@ -1953,6 +1953,158 @@ scheduling_clean_a5a_paired_summary.json、admission_matched_*_20261016.json、
 spec_natural_screen_20261016.json、spec_medusa_eagle_greedy_sharegpt_chat_b8_g4_seed012_20261016.json
 及 moe_int4_arrival_diag_seed42_r8_n16_i64_o64_focus5_14_rep5_20261016.json。
 
+### 10.3.21 2026-11-15 独立 CUDA FP16/BF16 GEMM
+
+新增 `benchmarks/cuda_gemm.cu`，手写 row-major `C=A@B`，FP16/BF16 输入输出、FP32
+累加。使用 `mma.sync`、`ldmatrix`、XOR shared-memory swizzle 和 2/3/4-stage
+`cp.async` 流水；21 组 block/warp/K tile 配置先检查正确性，再调优。此算子未接入引擎，
+也不是 INT4 实现；2026-10-05 的 FP16 GEMM 数据继续作为历史记录保留。
+
+本机 RTX 5060 Ti / SM120、PyTorch 2.8.0+cu128、WSL2 上，先调优再冻结配置，使用
+seed 42/17/7、7 种尺寸、每次 graph replay 100 次调用、每种子 7 轮配对测速。
+双方预分配输出、使用相同输入与 FP32 累加，基线直接调用 cuBLAS GemmEx，并关闭低精度
+reduction。4096³ 的三种子中位吞吐为 FP16 44.22 TFLOPS / BF16 45.25 TFLOPS，分别达到
+该 cuBLAS 基线的 94.6% / 94.7%。1024³ 则为 82.4% / 85.4%，不能把大矩阵比例外推到所有
+形状。BF16 的 128×11008×4096 达到该默认 GemmEx 基线的 119.1%，不是对 cuBLASLt
+全算法搜索最优值的证明。
+
+两种 dtype 从相同 FP32 原始矩阵舍入。对舍入输入的 FP64 参考，所有尺寸/种子的最大
+相对 L2 误差为 FP16 2.141e-4、BF16 1.735e-3；包含输入舍入后的总误差为
+3.693e-4 / 2.951e-3。大矩阵的 FP64 检查使用 64×64 输出采样、每个点覆盖全部 K，
+同时逐元素覆盖完整输出计算与 cuBLAS 的相对 L2 差异。420 项 shape/pattern/config
+正确性检查及 stream/graph/API 边界通过。Compute Sanitizer 因 WDDM debugger interface
+初始化失败而退出 1，不能声称 memcheck 通过。
+
+快路径要求 SM80+、连续且 16-byte 对齐的输入、N/K 为 8 的倍数；不齐的 N/K 使用标量
+CUDA 回退，M 与末尾 block 可不齐。无 autograd/transpose/alpha-beta/引擎集成；其他 GPU
+未实测。测量是 warm-cache CUDA Graph 算子时间，不包含分配、编译与主机调用，也不是
+推理吞吐。复现入口 `python -m benchmarks.cuda_gemm_bench`，冻结配置用
+`--tuning-report`；详细表与命令见
+[2026-11-15 GEMM report](benchmarks/_cuda_gemm_report_20261115.md)，原始 JSON 在被忽略的
+`results/cuda_gemm_20261115_*.json`。
+
+### 10.3.22 2026-11-15 CUDA GEMM 尺寸差距的 profiling 与分离验证
+
+针对 1024³ 比 4096³ 更难接近 cuBLAS 的问题，新增独立诊断入口
+`benchmarks/cuda_gemm_profile.py`。在相同 RTX 5060 Ti / WSL2 上，每组控制使用
+3 个种子、30-node graph、5 轮随机顺序配对测速；每个变体先验证正确性。
+正常的 21 个配置与默认地址布局保留，新增接口仅用于诊断。
+
+Nsight Systems 2026.5.1 成功采集时间线。FP16 1024³ 的原 cfg10 kernel 时间为
+58.19 µs，cuBLAS 为 48.00 µs；graph kernel 间隙分别为 0.174/0.172 µs，差距主要在
+kernel 内部，不能归因于 Python/主机发射。cfg10/17 在两种尺寸下的静态驻留上限均为
+4 blocks/SM、理论 occupancy 33.3%，local bytes/thread 为 0；“小尺寸理论 occupancy
+下降或寄存器溢出”没有证据。只增加未使用 shared memory 将驻留从 4 限至 1 会使两种
+尺寸都显著变慢，但不能解释原配置的相对差距。
+
+固定 cfg10，分别控制输出网格与 K。FP16 的 cuBLAS 效率在 `(M=N,K)` 为
+`(1024,1024)/(1024,4096)/(4096,1024)/(4096,4096)` 时依次为
+82.8%/88.2%/88.4%/94.7%；BF16 为 85.5%/89.9%/95.1%/95.9%。四格对称代数分解中，
+FP16 的 K/MN 效应为 +5.76/+6.05 个百分点，BF16 为 +2.56/+7.82 个百分点；这是
+shape 效应，不是硬件 stall 百分比。MN 改变还涉及缓存与 cuBLAS 算法选择，不能全部
+称为尾波损失。固定 N=K=1024、M 为 64 的倍数，所有输出 tile 完整；M=1152→1216
+使 block 数 144→152，FP16 cfg10 时间 62.58→78.21 µs，验证了调度颗粒/波次台阶。
+
+进一步固定 64×64 tile，并将 2–6 级流水的总 shared-memory 预留统一为 48 KiB，
+驻留上限相同；单纯加深流水没有追平 cuBLAS。仅替换 A 的 shared-memory swizzle
+也未改善原最优配置，地址模型中的潜在 bank 冲突不能据此认定为主要瓶颈。上述结果
+支持“短 K 的固定成本/稳态摊薄 + 输出网格/形状特化效应”的组合解释。
+
+Nsight Compute 2025.1.1 在计数器采集前报 `LibraryNotLoaded` 并退出 9，故没有 measured
+achieved occupancy、warp stall、带宽或 bank-conflict rate；具体 barrier/ldmatrix/epilogue
+各占多少周期仍未知。profile 时间与原正式 benchmark 分开保存，不覆盖历史数据。
+详细表、命令与局限见 [GEMM profiling report](benchmarks/_cuda_gemm_profile_20261115.md)，
+raw JSON/SQLite/`.nsys-rep` 在被忽略的 `results/cuda_gemm_profile/`。
+
+### 10.3.23 2026-11-15 Nsight Compute 性能计数器恢复
+
+旧 Linux ncu 2025.1.1 对独立 CUDA 探针报 `LibraryNotLoaded`、退出 9；换用本机
+Windows 安装附带的 Linux ncu 2026.3.1 后，同一探针成功完成 9-pass 采集。
+随后真实 GEMM 成功采集 LaunchStats、Occupancy、SpeedOfLight、SchedulerStats、
+WarpStateStats、MemoryWorkloadAnalysis、ComputeWorkloadAnalysis，并导出原始 CSV。
+整个对照没有修改驱动、注册表或计数器权限；证据定位到旧分析器与当前驱动组合，
+尚未确定 NVIDIA 内部具体哪一项 ABI/初始化检查失败。
+
+项目入口自动选择已发现的最高版本 Linux ncu，支持 `--ncu` / `NCU_BIN` 指定；
+新增独立探针与动态库加载诊断。历史失败日志保留，新采集按工具版本另存。
+详见 [NCU 恢复记录](benchmarks/_ncu_recovery_20261115.md)。原 §10.3.22 的计数器缺失
+描述限定为首次失败那批实验，不应据此推导新采集的 stall 百分比或改写原性能结果。
+
+### 10.3.24 2026-11-16 恢复计数器后的 GEMM 尺寸差距复测
+
+使用 ncu 2026.3.1 完成 34 次成功采集：自研/cuBLAS × FP16/BF16 × 1024³/4096³
+各三次独立采集，另有固定 cfg10 的 K、网格和完整 tile 波次控制。独立性能计时使用
+100-node CUDA Graph、三组种子、七轮随机顺序配对；计数器与计时分开运行，各路径先检查精度。
+沿用原冻结配置（1024 cfg10 / 4096 cfg17），本轮相对 cuBLAS 吞吐为
+FP16 **81.4% / 93.8%**、BF16 **85.5% / 93.6%**。这些是新的日期记录，不覆盖此前结果。
+
+自研 Tensor pipe elapsed 活跃度中位数在 1024³ 为 FP16 69.12% / BF16 69.46%，
+cuBLAS 为 82.95% / 78.52%；到 4096³ 自研为 95.65% / 95.64%，cuBLAS 为
+99.05% / 95.55%。该计数器表示管线活跃周期，不是有效 FLOP 利用率，不能直接用比值推导加速。
+FP16 1024³ 的自研 achieved occupancy 22.81%，cuBLAS 仅 15.76% 却更快，
+因此不能用“occupancy 更低”单独解释相对差距。
+
+固定 cfg10，FP16 1024³ 的 Tensor 活跃度 69.12%；只延长 K 到 4096 后为 79.39%，
+只扩大 M=N 到 4096 为 88.57%，两项同时增大为 95.67%。BF16 对应
+69.46%→78.03% / 88.20% / 95.70%。完整 tile 控制 M=1152→1216、N=K=1024，
+CTA 数由 144→152、工作量 +5.6%，自研 FP16 时间 62.53→82.33 µs，
+Tensor 活跃度 78.93%→66.77%；BF16 时间 62.24→77.76 µs，活跃度 78.31%→64.87%。
+这支持“小网格的调度/波次利用率 + 短 K 固定成本摊薄不足”的组合解释；本轮单独扩大
+网格的改善更明显。固定输出的线性 K 拟合中，自研 cfg10 截距约 10 µs，cuBLAS 为
+FP16 1.72 / BF16 6.16 µs；截距汇总多种固定工作，不能称为实测 prologue 时间。
+
+warp-state ratio 是 cycles/instruction，不是运行时间百分比；barrier、math-pipe throttle
+在大矩阵也更高，不能据此称其为小矩阵的独有主因。当前数据仍不能逐项拆出
+prologue、barrier、ldmatrix、epilogue 的独立耗时；此 SM120 采集也没有直接 shared
+bank-conflict count。旧的阶段深度与 A-swizzle 实验保留为历史观察，本轮没有修改或宣称优化 kernel。
+详见 [计数器对照报告](benchmarks/_cuda_gemm_counter_20261116.md)；原始数据位于
+`results/cuda_gemm_counter_20261116/`。复现：
+`bash benchmarks/run_cuda_gemm.sh --counter-study`，然后
+`python -m benchmarks.cuda_gemm_counter_report`。工具选择与 CSV 单位/单 kernel 解析共六项测试通过。
+
+### 10.3.25 2026-11-16 原生 CUDA FP8 GEMM 与 cuBLASLt
+
+新增独立 `cuda_fp8_gemm.cu` / `cuda_fp8_gemm_bench.py`，不修改引擎 dispatch。
+输入 A[M,K]、预打包 W[N,K] 为 E4M3，FP32 累加、BF16 输出，支持有限 scalar alpha。
+使用 SM120a 原生 `mma.sync...kind::f8f6f4`，反汇编确认为
+`QMMA.16832.F32.E4M3.E4M3`；输入没有先反量化成 BF16。
+包含 cp.async、ldmatrix、shared-memory XOR swizzle、多级流水、对齐时的 BF16 成对写回，
+以及最多八个 M tile 的分组 CTA 调度。28 个候选覆盖 block/warp/K tile 与流水级数。
+K 必须为 16 的倍数，输入 contiguous 且 16-byte aligned；自研路径支持 M/N/K 尾块、
+空输出与 K=0，其他 K 对齐显式拒绝。E5M2×E5M2 另做自研正确性测试，没有相应 Lt 性能结论。
+
+cuBLASLt 基线为相同 FP8 数据/布局、alpha、BF16 输出，COMPUTE_32F、FAST_ACCUM=0，
+最多 32 MiB workspace；在最多 32 个 heuristic 候选中调优，不是穷举所有算法。
+两方均在独立 seed-20261116 数据上选择配置，随后冻结自研 config 与 Lt 的算法属性
+（ID/tile/stages/split-K/reduction/swizzle/custom/workspace），在 seeds 7/17/42 上
+用 100-node CUDA Graph、七轮随机顺序配对验证。量化、转置/打包、分配、plan/graph setup
+不计入时间，不能将此结果描述为包含量化的端到端收益。
+
+分组候选最终一轮八种形状的相对 Lt 吞吐中位数依次为：
+64×4096×4096 **86.1%**；256×4096×4096 **93.8%**；1024³ **93.1%**；
+2048³ **99.0%**；4096³ **97.0%**；128×11008×4096 **89.1%**；
+512×4096×11008 **91.8%**；8192×4096×4096 **97.7%**。
+未分组的最初 18-config 观察保留在另一份原始文件，不与最终一轮时间混算。
+超过 L2 容量的权重不能因重复使用地址就称为全部 cache-resident。
+
+最终 24 个 seed/shape 输出均通过 FP64 decoded-FP8 参考与完整 cuBLASLt 输出检查。
+最大算术/输出舍入 relative L2 为 **0.00169845**，包括 E4M3 量化的原 FP32 参考误差
+最大 **0.03939476**，与 Lt 全输出 relative L2 最大 **0.00005921**；不能把量化误差
+当作算术误差容差，也不能据随机矩阵误差推断模型质量。
+GPU 测试覆盖全部 28 个配置、分组尾部、奇数 M/N、K 尾块、E5M2、常数/identity、
+非默认 stream、CUDA Graph、alpha、空输出、K=0 和错误 API/plan 输入，2 项 pytest 通过。
+同输入、同 tile/warp/K/stage 的分组对照（三组种子、七轮、100-node graph）中，
+cfg0→18 在 128×11008×4096 / 512×4096×11008 / 4096³ 分别为
+**1.919× / 1.123× / 1.012×**；cfg3→19 为 **1.103× / 1.019× / 0.995×**，
+cfg11→22 则约 0.99×。各分组配置对输出 bitwise 相同；分组并非对所有 tile 都有收益。
+最佳长 N 配置还改变了 tile，不能把它的全部变化都归因于分组；这里只验证计时差，
+未将其分解为实测 DRAM/L2 流量。分组对照原始文件为
+`results/cuda_fp8_group_ablation_20261116.json`。
+原 FP16/BF16 算子与 21 个 config ID 保留不变。详见
+[FP8 GEMM 报告](benchmarks/_cuda_fp8_gemm_20261116.md)，原始数据为
+`results/cuda_fp8_gemm_grouped_20261116.json`。复现使用 WSL helper 的 `--fp8`、
+`--fp8-pytest`、`--fp8-ablation`、`--fp8-profile` 及 `cuda_fp8_gemm_report.py`。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：
@@ -1971,6 +2123,58 @@ nsys stats -r cuda_gpu_kern_sum /tmp/nanovllm_kernels.nsys-rep
 ncu --set basic --launch-count 20 python benchmarks/bench.py --num-seqs 8 \
   --min-input-len 128 --max-input-len 128 --min-output-len 16 --max-output-len 16 --enforce-eager
 ```
+
+**WSL2 Nsight Systems capture:** `benchmarks/nsys_profile.py` marks inference with an NVTX range
+after model loading and warmup. It labels engine steps, scheduler/runner stages, Qwen3
+decoder layers, attention, MLP, embedding, final norm, LM head, and sampling. It also labels
+DeepSeek-V2 decoder layers, MLA attention, dense MLP, MoE, shared experts, embedding, final norm,
+and LM head. For DeepSeek-V2-Lite on a 16 GB GPU, use INT4 group size 64 with streaming load.
+This adds profiling support only; the historical measurements below remain the Qwen3-0.6B run.
+The tool uses eager execution and disables multi-step decode so individual CUDA kernels and per-layer ranges remain
+visible when CUDA tracing works. Nsight Systems 2024.6.2 in WSL2 did not honor NVTX-triggered
+capture, so the whole process is recorded and the UI should focus on the `nsys_capture` range. It
+also writes per-module current-stream CUDA Event timings to JSON:
+
+```bash
+mkdir -p profiles
+PYTHONPATH=. /usr/local/bin/nsys profile --force-overwrite=true \
+  --trace=cuda,nvtx,osrt,cublas --stats=true --sample=none --cpuctxsw=none \
+  -o profiles/qwen3_0.6b_nsys \
+  python benchmarks/nsys_profile.py --num-seqs 8 --min-input-len 512 \
+  --max-input-len 512 --min-output-len 32 --max-output-len 32 \
+  --gpu-event-json profiles/qwen3_0.6b_nsys_gpu_events.json
+```
+
+Open `profiles/qwen3_0.6b_nsys.nsys-rep` in Windows Nsight Systems. NVTX/Event hooks add overhead,
+so these artifacts locate work but do not represent normal serving throughput. Keep the earlier
+torch.profiler/CUPTI and ncu observations above as historical results; Nsight Systems is a
+separate collection path whose availability depends on the WSL2 driver/toolkit setup. The
+first 2026-11-02 WSL2 run used Nsight Systems 2024.6.2 and generated `.nsys-rep`/`.sqlite`
+files with NVTX statistics but empty CUDA API, kernel, and memory tables. After installing the
+2026.5.1 CLI, an NVTX-triggered attempt still produced no report, so the successful follow-up used
+ordinary full-process capture and selected `nsys_capture` for inference analysis. The new report
+is `profiles/qwen3_0.6b_nsys_cuda_full_20261102.nsys-rep`; its companion SQLite export is
+`profiles/qwen3_0.6b_nsys_cuda_full_20261102.sqlite`.
+Nsight warned that the installed CUDA driver 13.5 was not supported by this build, then loaded
+its CUDA 13.4 CUPTI library, initialized injection, and used hardware tracing. The CUDA API,
+kernel, and copy tables are populated. Unified Memory tracing was unavailable on this device.
+
+The follow-up used the same eager TP=1 workload: eight requests, 512 input tokens and 32 output
+tokens each. `nsys_capture` lasted 975.4 ms and covered 34 engine steps (1 prefill, 2 mixed, 31
+decode). It contains 12,917 GPU kernel events with a summed kernel duration of 261.7 ms. By
+kernel-name group, CUTLASS GEMMs account for 190.5 ms (72.8%), FlashAttention for 53.1 ms
+(20.3%), Triton for 15.4 ms (5.9%), and other kernels for 2.6 ms (1.0%). These are sums of
+individual kernel durations, not GPU utilization; concurrent kernels can overlap. Within the
+capture, the largest CUDA runtime API totals were `cuLaunchKernel` (118.7 ms across 10,710
+calls), `cudaMemcpyAsync` (56.0 ms across 242 calls), and event recording (48.8 ms across 6,124
+calls). Host API durations overlap GPU execution and should not be added to kernel durations.
+
+The accompanying CUDA Event JSON reports per-module current-stream elapsed times. For decode,
+Attention averaged 13.6 ms and MLP 4.6 ms per forward; for prefill they were 24.6 ms and 25.5 ms.
+These events can include stream idle gaps, and module ranges nest, so the Nsight kernel timeline is
+the source for kernel-active durations. All figures are specific to this instrumented workload;
+NVTX/Event instrumentation adds overhead, so they are for bottleneck location rather than
+throughput comparison.
 
 ### 10.5 读数要点与诚实规则
 

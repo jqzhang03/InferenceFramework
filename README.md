@@ -772,8 +772,129 @@ nanovllm/
 ├─ server.py  OpenAI-style HTTP/SSE service and in-memory conversations
 └─ utils/     weight loader · Context singleton (per-step data contract)
 tests/        pytest suite
-benchmarks/   bench.py · context_concurrency.py · kv_fp8_calibrate.py · scheduling_ablation.py · profiler.py · probes & reports (see INTERVIEW.md §1.8)
+benchmarks/   bench.py · context_concurrency.py · kv_fp8_calibrate.py · scheduling_ablation.py · profiler.py · nsys_profile.py · probes & reports (see INTERVIEW.md §1.8)
 ```
+
+## Nsight Systems profiling
+
+From the WSL2 project directory and nano-vLLM conda environment, run:
+
+```bash
+mkdir -p profiles
+PYTHONPATH=. /usr/local/bin/nsys profile --force-overwrite=true \
+  --trace=cuda,nvtx,osrt,cublas --stats=true \
+  --sample=none --cpuctxsw=none \
+  -o profiles/qwen3_0.6b_nsys \
+  python benchmarks/nsys_profile.py --num-seqs 8 \
+  --min-input-len 512 --max-input-len 512 \
+  --min-output-len 32 --max-output-len 32 \
+  --gpu-event-json profiles/qwen3_0.6b_nsys_gpu_events.json
+```
+
+Open `profiles/qwen3_0.6b_nsys.nsys-rep` in a Windows Nsight Systems GUI that supports
+reports from CLI 2026.5.1, and focus on the `nsys_capture` NVTX range; the full report also includes model loading and
+warmup. NVTX ranges identify engine steps,
+scheduler/runner stages, Qwen3 decoder layers/attention/MLP or DeepSeek-V2 decoder
+layers/MLA/MLP/MoE/shared MLP, the LM head, and sampling. The default model is
+Qwen3-0.6B. For DeepSeek-V2-Lite on a 16 GB GPU, use INT4 group size 64 and
+streaming load:
+
+```bash
+PYTHONPATH=. /usr/local/bin/nsys profile --force-overwrite=true \
+  --trace=cuda,nvtx,osrt,cublas --stats=true \
+  --sample=none --cpuctxsw=none \
+  -o profiles/deepseek_v2_lite_int4_nsys \
+  python benchmarks/nsys_profile.py \
+  --model ~/huggingface/DeepSeek-V2-Lite \
+  --quantization int4 --int4-group-size 64 --streaming-load \
+  --num-seqs 8 --min-input-len 512 --max-input-len 512 \
+  --min-output-len 32 --max-output-len 32 \
+  --gpu-event-json profiles/deepseek_v2_lite_int4_nsys_gpu_events.json
+```
+
+The script forces eager execution and disables multi-step decode so individual
+CUDA kernels are visible. The original WSL Nsight Systems 2024.6.2 capture
+recorded NVTX only. With the 2026.5.1 CLI, ordinary full-process capture records
+CUDA API, kernel, and memory events on this machine. An NVTX-triggered attempt
+with 2026.5.1 produced no `.nsys-rep`, so omit `--capture-range` and focus on
+`nsys_capture` in the full report. The script also writes current-stream CUDA
+Event elapsed times to JSON; these can include stream idle gaps and nested
+ranges overlap, so they are not kernel-active times. NVTX/Event instrumentation
+adds overhead; use these artifacts to locate work rather than compare throughput.
+Adjust `--model` if the checkpoint is not at `~/huggingface/Qwen3-0.6B/` in WSL.
+
+## Standalone CUDA FP16/BF16 GEMM
+
+`benchmarks/cuda_gemm.cu` provides handwritten row-major FP16/BF16 GEMM with FP32
+accumulation, Tensor Core MMA, swizzled shared memory, and asynchronous copy
+pipelines. It is an independent operator experiment; it is not integrated into
+the inference engine. It requires SM80+, contiguous 2D inputs, and 16-byte input
+alignment. N/K multiples of 8 use the fast path; other N/K sizes use a scalar
+CUDA fallback. Partial block tiles, empty matrices, the current CUDA stream, and
+CUDA Graph capture are supported. No autograd or transposed inputs are provided.
+
+```bash
+python -m benchmarks.cuda_gemm_bench --check-only
+python -m benchmarks.cuda_gemm_bench --output results/cuda_gemm.json
+```
+
+Building this optional extension requires a CUDA toolkit, Ninja, a compatible C++
+compiler, and CUDA-enabled PyTorch. Both backends use preallocated outputs; the
+baseline calls cuBLAS GemmEx directly with FP32 accumulation. Accuracy uses FP64
+references, including a separate measurement of input rounding. See the
+[2026-11-15 operator report](benchmarks/_cuda_gemm_report_20261115.md) for measured
+performance, per-shape limits, and frozen-configuration reproduction commands.
+
+The [profiling attribution report](benchmarks/_cuda_gemm_profile_20261115.md)
+separates GPU kernel time from graph/eager gaps and tests K length, output-grid
+scheduling, shared-memory residency, pipeline depth, and address layout. Run
+`bash benchmarks/run_cuda_gemm.sh --profile --mode suite` for the primary
+controls; `rows`, `stages`, `layout`, and `nsys` select additional experiments.
+Nsight Systems traces worked on this machine. Nsight Compute 2025.1.1 initially
+failed with `LibraryNotLoaded`; switching to the existing Linux CLI 2026.3.1
+restored hardware-counter collection. The entry selects the newest discovered
+Linux ncu, with `--ncu` / `NCU_BIN` overrides. Run
+`bash benchmarks/run_cuda_gemm.sh --profile --mode ncu --dtype fp16 --size 1024 --config 10`
+for a real GEMM or `bash benchmarks/run_cuda_gemm.sh --ncu-diagnose --mode probe`
+for an independent CUDA probe. See the [recovery record](benchmarks/_ncu_recovery_20261115.md)
+for verification and artifact locations. The original attribution measurements
+remain separate from the recovered counter dataset.
+
+The [2026-11-16 counter comparison](benchmarks/_cuda_gemm_counter_20261116.md)
+adds repeated custom/cuBLAS captures and fresh paired timings. Fixed-kernel
+controls separate K length from output-grid and scheduling effects; occupancy
+alone does not explain the small-matrix gap. Reproduce with
+`bash benchmarks/run_cuda_gemm.sh --counter-study`, then
+`python -m benchmarks.cuda_gemm_counter_report`. Each capture checks accuracy
+before profiling. Raw counter units and profiling times are kept separate from
+the unprofiled benchmark.
+
+### Native CUDA FP8 GEMM experiment
+
+The standalone [FP8 operator and report](benchmarks/_cuda_fp8_gemm_20261116.md)
+target RTX Blackwell SM120 with native FP8 Tensor Core instructions, FP32
+accumulation and BF16 output. E4M3 inputs use `A[M,K]` and prepacked `W[N,K]`;
+K must be divisible by 16 and inputs must be contiguous and 16-byte aligned.
+The implementation includes multistage async copies, swizzled shared memory,
+paired output stores and optional grouped CTA scheduling for L2 reuse. It does
+not change inference-engine dispatch.
+
+```bash
+bash benchmarks/run_cuda_gemm.sh --fp8 --check-only
+bash benchmarks/run_cuda_gemm.sh --fp8 --output results/cuda_fp8_gemm_grouped_20261116.json
+bash benchmarks/run_cuda_gemm.sh --fp8-pytest
+bash benchmarks/run_cuda_gemm.sh --fp8-profile
+python -m benchmarks.cuda_fp8_gemm_report
+```
+
+The comparison tunes both custom configurations and a cuBLASLt heuristic subset,
+then freezes the selections for independent validation inputs. Both paths receive
+identical packed FP8 tensors, output type and scale. Timings exclude quantization,
+transpose/packing and plan setup; accuracy reports arithmetic and quantization
+errors separately. The report retains per-shape results and limits; these are
+operator measurements on this GPU, not end-to-end serving gains. CUDA 12.8+ and
+an sm_120a build are required. Native E5M2 correctness is checked separately;
+performance results cover E4M3 only.
 
 ## License
 
