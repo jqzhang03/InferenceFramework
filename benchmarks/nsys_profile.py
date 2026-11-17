@@ -38,7 +38,7 @@ import statistics
 import torch
 
 from nanovllm import LLM, SamplingParams
-from bench import add_workload_args, build_workload
+from benchmarks.bench import add_workload_args, build_workload
 
 
 _MODEL_LABELS = {

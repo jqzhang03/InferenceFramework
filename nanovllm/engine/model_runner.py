@@ -113,6 +113,9 @@ class ModelRunner:
             elif config.quantization == "fp8":
                 self.quantize_fp8_weights()
         # 调用预热方法，执行一次模拟prefill来分配显存、初始化CUDA内核，并测量峰值显存
+        from nanovllm.layers.cuda_linear import install_cuda_linears
+        self.cuda_linear_count = install_cuda_linears(
+            self.model, config.linear_backend, config.cuda_linear_tuning)
         self._finalize_mla_mode()   # MLA 模型模式收尾（decode 内核 vs 稠密兜底）
         self._finalize_rolling()    # SWA 滚动缓冲（mistral 校验 + 层标记）
         self.warmup_model()

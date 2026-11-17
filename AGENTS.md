@@ -1,5 +1,65 @@
 # Repository Guidelines
 
+### Current Decode full inference profiling (2026-11-16)
+
+`run_qwen_cuda.sh --nsys --suite decode-current --output <fresh-dir>` profiles
+cuda_decode using bundled selectors with default scheduling/multi-step/mixed
+Graph flags, plus controlled and eager diagnostics. Resource caps remain explicit
+(16 sequences, 2048 batched/context tokens, 0.55 GPU memory utilization).
+`--full-nsys-report --root <dir>` runs qwen_decode_full_report.py, producing
+phase/component CSV/JSON and the dated full report. Startup/warmup NVTX scopes
+are separate from nsys_capture. Count Mixed forwards independently; the default
+B=8 run recorded 3 prefill, 3 mixed, 93 decode forwards across three batches.
+Eager leaf-module launch correlation provides non-overlapping GPU attribution;
+only unique RoPE/Embedding/Norm/SiLU kernel identities transfer to graph labels.
+Do not sum inclusive CPU NVTX with GPU kernel time or equate GPU activity union
+with occupancy. See benchmarks/_qwen_decode_full_nsys_20261116.md.
+
+### CUDA Decode weight reuse (2026-11-16)
+
+`layers/csrc/cuda_decode.cu` adds NT-oriented m16n8 MMA, shared XOR swizzle,
+cp.async staging, FP32 Split-K/finish, and batched SIMT candidates with padded
+uint4 shared vectors and 8/16/32-lane shuffle reduction. Configs 0–22 are normal;
+23 is no-swizzle diagnostic only. `linear_backend="cuda_decode"` automatically
+loads cuda_decode_sm120.json on RTX 5060 Ti BF16; otherwise it retains legacy
+dispatch unless supplied matching selectors. Only measured winning O/down shapes
+enable new kernels; M=1 and QKV/gate-up keep previous kernels. Defaults remain
+torch. FP16/BF16 correctness and graph replay are GPU tested; TP=1 mixed only.
+`cuda_decode_study.py` tunes, validates rotating 28 weights, freezes deployment,
+replays model pairs and collects ncu/nsys; helper flags are --decode-study,
+--decode-pytest, --decode-report. Keep dated raw results and old kernels intact.
+Representative down bank-conflict counters fell 516330 -> 245 with swizzle;
+not all residual conflicts are zero. Compute Sanitizer could not initialize the
+WDDM debugger interface; do not claim a passed memcheck. See
+benchmarks/_cuda_decode_reuse_20261116.md and paired Windows traces under
+profiles/cuda_decode_reuse_20261116/.
+
+### Qwen CUDA projection integration (2026-11-16)
+
+Nsight trace collection: `bash benchmarks/run_qwen_cuda.sh --nsys --output <fresh-dir>`
+and `--nsys-report --root <dir>` use qwen_cuda_nsys.py / qwen_cuda_nsys_report.py.
+Six graph/eager/baseline/FP8 cases capture full-process CUDA/NVTX/OSRT/cuBLAS with
+CUDA Graph node tracing, analyze only nsys_capture, and correlate LM-head/sampling
+kernels with CUDA API launch IDs. Eager has CPU module NVTX hooks, no CUDA Event
+hooks; do not use its wall time as an uninstrumented performance result. Outputs
+are Windows-readable .nsys-rep plus SQLite/JSON. Preserve existing trace folders.
+See benchmarks/_qwen_cuda_nsys_20261116.md; GPU active union is not occupancy,
+and long cudaMemcpyAsync CPU duration may be GPU wait rather than transfer time.
+
+`nanovllm/layers/cuda_linear.py` installs per-layer adapters in ModelRunner before
+warmup/capture. Config.linear_backend defaults to torch; cuda/cuda_auto and
+cuda_fp8/cuda_fp8_auto are opt-in, Qwen3 TP=1 mixed execution only, without other
+weight quantization. The decoder's QKV/O and MLP projections are covered; the
+tied LM head and FlashAttention are unchanged. Runtime sources live in
+layers/csrc and are packaged; standalone benchmark sources retain their historical
+config IDs. Runtime BF16/FP16 adds vectorized GEMV and small-M configs 21–23.
+FP8 uses fused per-row dynamic BF16 activation quantization and a scaled native
+MMA epilogue. Weight copies increase memory consumption. Auto dispatch uses a
+frozen device/backend-matched report and falls back on unseen shapes. Graph
+and precision tests: tests/test_cuda_linear.py. Benchmark helper:
+benchmarks/run_qwen_cuda.sh; report: benchmarks/_qwen_cuda_linear_20261116.md.
+Do not infer model quality from random-input GEMM accuracy or token parity.
+
 ## Project Structure & Module Organization
 
 All source code lives under `nanovllm/`:

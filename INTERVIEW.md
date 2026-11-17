@@ -2105,6 +2105,132 @@ cfg11→22 则约 0.99×。各分组配置对输出 bitwise 相同；分组并�
 `results/cuda_fp8_gemm_grouped_20261116.json`。复现使用 WSL helper 的 `--fp8`、
 `--fp8-pytest`、`--fp8-ablation`、`--fp8-profile` 及 `cuda_fp8_gemm_report.py`。
 
+### 10.3.26 2026-11-16 Qwen3-0.6B CUDA 投影接入与受控复测
+
+新增 `linear_backend` 可选后端，初始化时向 28 层的 QKV/O、MLP gate/up/down
+共 112 个投影安装 CUDA adapter。LM head 和 FlashAttention 沿用原路径。
+运行时新增向量化 GEMV、16/32 行 GEMM tile，以及 FP8 逐行动态量化和缩放输出；
+独立算子的历史源码、config ID 和报告保持原样。支持 TP=1、mixed 执行、无已有权重量化。
+
+RTX 5060 Ti、BF16 模型、固定 Prefill 预算、CUDA Graph Decode、每请求固定生成
+32 token：两轮反向后端顺序，每轮每点五次、每次不同但后端间一致的合成 token 输入。
+下表为两轮中位耗时的均值（ms），排除加载/编译/权重打包，计入 FP8 激活量化。
+
+| batch / 输入长度 | 调库 | 初始 CUDA | 调优 BF16 CUDA | BF16 混合选择 | FP8 混合选择 |
+|---|---:|---:|---:|---:|---:|
+| 1 / 128 | 195.39 | 143.59 | 143.88 | 145.35 | 131.58 |
+| 8 / 128 | 170.36 | 237.59 | 186.14 | 170.97 | 166.69 |
+| 1 / 1024 | 168.45 | 159.71 | 158.76 | 161.69 | 168.31 |
+
+BF16 batch=8 调优较初始接入耗时下降约 21.7%，仍慢于调库；按形状回退的 BF16
+混合选择接近调库。FP8 的 batch=8 两轮中位分别 193.58/139.81 ms，长提示
+143.80/192.81 ms，未建立稳定收益。仅 Prefill 使用 FP8 的后续筛查也未建立稳定改进。
+短提示单请求上的本机收益不能推广为通用推理加速。
+
+三个 GPU 测试通过，覆盖 FP16/BF16 算术误差、FP8 逐行缩放与变更输入后的图重放。
+固定提示最后位置的 BF16 混合选择 logits 在两个诊断样本上与调库相同；FP8
+相对 L2 约 7.1%/9.9%，两点 top-1 相同，但生成 token 并非全部一致，尚无真实文本
+困惑度/任务质量评估，因此保留实验状态，默认仍为 torch。额外权重副本增加显存。
+
+早期自适应调度尝试保留在 `results/qwen_cuda_inference_20261116/`；其首次前向
+logits 对应不同的分块位置，不能作为精度证据，也不与受控数据合并。最终数据在
+`results/qwen_cuda_controlled_20261116/`。详见
+[接入报告](benchmarks/_qwen_cuda_linear_20261116.md)，复现使用
+`benchmarks/run_qwen_cuda.sh` 和 `qwen_cuda_linear_report.py`。
+
+### 10.3.27 2026-11-16 Qwen3 新 CUDA 算子的 Nsight Systems 瓶颈分析
+
+Nsight Systems 2026.5.1 全进程 CUDA/NVTX/OSRT/cuBLAS 采集，启用 CUDA Graph
+node tracing。有效范围为预热后的 `nsys_capture`，每份 3 次 Prefill、93 次 Decode。
+六份轨迹覆盖调库 B=8、调优 BF16 CUDA B=1/B=8/长提示、FP8 混合 B=8，
+以及带逐层 CPU NVTX 标记的 CUDA eager B=8。无逐模块 CUDA Event 插桩。
+
+BF16 CUDA Graph B=8 的 Decode kernel 时间：投影约 65.5%、LM head 16.6%、
+FlashAttention 11.7%；每步投影 3.148 ms，调库对照为 2.652 ms。
+93 步约多 46.2 ms，与两份轨迹 kernel 总差 46.9 ms 接近，额外 GPU 耗时主要
+集中在窄 M 的 Decode 投影。本次 FP8 量化仅占其全部 kernel 时间约 3.3%。
+Graph 各点 GPU 活动并集占窗口 74.6%–87.3%；有 hooks 的 eager 为 21.9%，
+说明 eager 的主机提交间隙很明显，但不能将插桩 wall time 当成无 profiler 吞吐。
+
+B=8 CUDA Graph 的 cudaMemcpyAsync CPU 累计约 473 ms，实际 GPU copy/memset
+仅约 1.23 ms、约 1.63 MB。逐步采样后 `.tolist()` 等待 GPU，应区分 API 等待和
+传输耗时；不能据 API 的长持续时间认定 PCIe 是瓶颈。LM head/sampling 内核通过
+launch correlation ID 关联到 NVTX，避免把大词表投影计入 decoder CUDA 算子。
+Nsight Systems 的活动比例不是 occupancy，也不能据此判断硬件 memory/compute stall。
+
+Windows 可直接打开本地 `profiles/qwen_cuda_nsys_20261116_v2/*.nsys-rep`。
+有效 SQLite、参数/输出 JSON、命令与分析 JSON 同目录保留；初次模块导入失败记录
+另存于无 `_v2` 的目录。新入口为 `run_qwen_cuda.sh --nsys --output <新目录>`，
+`--nsys-report --root <目录>` 生成
+[详细报告](benchmarks/_qwen_cuda_nsys_20261116.md)。该 profiling 数据不与此前
+无插桩性能测量合并，也没有修改自研算子实现。
+
+### 10.3.28 2026-11-16 Decode 投影权重复用、线程划分和 bank-conflict 优化
+
+新增 `cuda_decode.cu`：以 W[N,K]×X[M,K]ᵀ 映射 m16n8 MMA，请求数放到 n8 轴，
+共享内存 XOR swizzle、cp.async 多级预取、warp 按输出通道划分。长 K/窄 N 的
+down 投影采用 Split-K 和 FP32 partial 归约。另实现批量 SIMT 的权重寄存器复用、
+padded uint4 shared 激活、8/16/32-lane shuffle，但实测未胜出，不强行部署。
+23 个正常配置之外保留 cfg23 无 swizzle 诊断。原独立算子源码/config ID 保持不变。
+
+轮换 28 份权重训练选择，独立 seed99 验证：M=8 O 投影旧 24.42、新 12.66 μs，
+down 旧 30.98、新 18.04 μs。QKV/gate-up、M=1 没有明确收益，保留旧路径；
+冻结选择仅将 M=4/8/16 的 O/down 切到新内核。O 使用 BK128 非 Split-K，
+down M=4/8 使用 Split-K8，M=16 使用 Split-K4。归约和临时结果开销计入测量。
+
+Qwen3-0.6B BF16、TP=1、固定 Prefill 预算、CUDA Graph Decode、32 输出 token，
+两个反向顺序轮次各五次输入，B=8/L=128 的中位均值：调库 172.90 ms，
+旧调优 CUDA 191.37 ms，新路径 162.92 ms（比旧耗时下降约 14.9%，约 1.175×）。
+单请求保留旧 kernel，本轮端到端略慢，未建立单请求收益。Nsight 新旧对照中，
+Decode 投影由 2.9670 降为 2.2723 ms/forward，LM head/Attention 大致相当。
+
+代表性 NCU bank-conflict 对照：O shared load/store 均为 0；down load 245、store 0，
+关闭 swizzle 后 load 516330、store 0。相同 tile 的轮换权重耗时由 18.963 降为
+17.382 μs，约下降 8.3%。这些是单次代表性原始计数，不是 runtime stall 百分比，
+也不代表所有残余冲突归零。早期请求数指标 n/a 保留，未当作 0。
+
+6 个 GPU 测试通过，含 FP16/BF16 全配置/尾块/K=0、变更输入后的图重放，以及
+打包默认配置的实际投影分派。B=8 完整请求 token 一致性为 64/80，不宣称端模型
+质量无损。Compute Sanitizer 因 WDDM debugger interface 未启用而初始化失败，
+未获得有效 memcheck。`linear_backend="cuda_decode"` 在 RTX 5060 Ti BF16 自动
+加载打包选择器，其他设备/dtype/未测形状保留旧 dispatch；默认仍为 torch。
+
+见 [优化报告](benchmarks/_cuda_decode_reuse_20261116.md)。原始数据在
+`results/cuda_decode_reuse_20261116/`，新旧 Windows Nsight 时间线在
+`profiles/cuda_decode_reuse_20261116/`。helper 提供 `--decode-study`、
+`--decode-pytest` 和 `--decode-report`，复测使用新目录保留历史。
+
+### 10.3.29 2026-11-16 当前新算子后端的完整推理 Nsight 分解
+
+新采集使用 `cuda_decode` 打包配置，恢复默认 multi-step Decode（最多4步）、
+mixed Graph、latency/SLO/TPOT-aware 调度和 KV swap 开关；资源上限显式设为
+16 sequences、2048 batch/context tokens、0.55 GPU memory utilization。
+五份 Windows `.nsys-rep` 覆盖 B=1/L=128、B=8/L=128、B=1/L=1024、固定预算
+B=8 对照和 eager 逐层诊断；每请求 32 输出 token、每份三批合成输入、两批预热。
+初始化/预热和 `nsys_capture` 分别标记，不与历史固定预算测量合并。
+
+默认 B=8 跨三批有 3 Prefill、3 Mixed、93 Decode forwards；每批平均 wall time
+219.01 ms，其中 Runner prefill 39.357、mixed 10.676、decode 163.207 ms，
+Runner 外 5.774 ms。multi-step 下 engine.step 共30次，不能与 forward 数混同。
+GPU kernel 每批 154.059 ms：投影含 Split-K 归约 98.706（64.1%）、LM head
+25.024（16.2%）、Attention 19.177（12.4%）、RMSNorm 3.768（2.4%）、
+采样 3.108（2.0%）。RoPE 2.194、SiLU 0.829、KV 写入 1.001 ms。
+
+GPU 活动并集为正式窗口 70.5%，每批约64.592 ms 无 GPU 活动；不等于 occupancy
+或纯 CPU 计算。cudaMemcpyAsync CPU 累计约401.63 ms，实际 GPU copy/memset
+仅1.089 ms、约1.60 MB，需识别采样后 `.tolist()` 等待计算，而不能归因于 PCIe。
+默认调度和固定预算点的形状/forward 数不同，不用两条轨迹直接证明调度开关收益。
+
+eager 叶子模块通过 launch correlation ID 归因，避免父子重复：每批 gate/up
+37.821、QKV 25.405、down 21.945、O 14.189 ms；仅用于逐层诊断，其 hooks/提交
+改变执行节奏，不当作 Graph 的同等时间。RoPE 是共享模块，单独标注 shared_rotary_emb。
+唯一归属的非线性 kernel 名称可补充 Graph 分类；其余保留 Other，不强行推断。
+
+报告：[完整推理分解](benchmarks/_qwen_decode_full_nsys_20261116.md)。
+原始 `.nsys-rep`、SQLite、配置/输出 JSON、summary.json、components.csv 保留于
+`profiles/qwen_decode_full_nsys_20261116/`。复现入口 `--nsys --suite decode-current`
+与 `--full-nsys-report`，均使用新目录保留历史。本次没有修改算子或引擎实现。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：

@@ -4,6 +4,45 @@
 
 # Nano-vLLM
 
+**Decode projection optimization:** `LLM(model, linear_backend="cuda_decode")`
+uses a bundled RTX 5060 Ti / BF16 selector for Qwen3-0.6B. It enables shared-tile
+weight reuse and transposed MMA on measured small batches, including FP32 Split-K
+reduction where beneficial. Other shapes/dtypes/devices retain the legacy CUDA
+dispatch. TP=1 mixed execution without other weight quantization is required.
+On the measured batch=8 / 128-input / 32-output workload it reduced generation
+time from 191.37 to 162.92 ms versus the previous CUDA backend; library time was
+172.90 ms. Single-request gains are not established. See the
+[optimization and bank-conflict report](benchmarks/_cuda_decode_reuse_20261116.md).
+
+Current-backend full inference traces (default scheduler/multi-step settings):
+`bash benchmarks/run_qwen_cuda.sh --nsys --suite decode-current --output profiles/qwen_decode_full_NEW`,
+then `bash benchmarks/run_qwen_cuda.sh --full-nsys-report --root profiles/qwen_decode_full_NEW`.
+This emits five Windows `.nsys-rep` traces plus phase/component CSV and JSON;
+startup, warmup and steady inference are marked separately. See the
+[full inference breakdown](benchmarks/_qwen_decode_full_nsys_20261116.md).
+
+Qwen3 TP=1 supports opt-in CUDA decoder projections:
+`LLM(model, linear_backend="cuda")` uses FP16/BF16;
+`linear_backend="cuda_fp8"` uses experimental native FP8 with a BF16 model on SM120.
+QKV/O and MLP projections are replaced; FlashAttention and the vocabulary head
+keep their existing paths. Compilation and weight packing happen before CUDA
+Graph capture. Extra transposed/FP8 weight buffers consume GPU memory. Existing
+weight quantization, PD and TP>1 cannot be combined with this backend.
+The default is still `linear_backend="torch"`.
+
+Tune with `bash benchmarks/run_qwen_cuda.sh --backend cuda --output results/qwen_cuda_bf16_tune.json`,
+then pass `cuda_linear_tuning=...`. `cuda_auto` / `cuda_fp8_auto` accept matching
+reports that allow library fallback; unseen shapes use PyTorch. FP8 activation
+quantization is included in inference timing and changes arithmetic precision.
+See [Qwen CUDA integration measurements](benchmarks/_qwen_cuda_linear_20261116.md).
+
+For Windows Nsight Systems timeline inspection, run
+`bash benchmarks/run_qwen_cuda.sh --nsys --output profiles/qwen_cuda_nsys_NEW_RUN`
+and `bash benchmarks/run_qwen_cuda.sh --nsys-report --root profiles/qwen_cuda_nsys_NEW_RUN`.
+This captures tuned CUDA graph/eager, FP8 and library cases, emitting `.nsys-rep`,
+SQLite and JSON. Focus the UI on `nsys_capture`; see the
+[kernel bottleneck report](benchmarks/_qwen_cuda_nsys_20261116.md).
+
 A from-scratch, vLLM-style inference engine for offline generation and local online serving, built on **PyTorch + Triton + flash-attn** — no inference framework dependency. It is developed and measured on an RTX 5060 Ti 16GB (Blackwell sm_120) under WSL2; benchmark claims are tied to dated evidence in [`INTERVIEW.md`](INTERVIEW.md) (Chinese master doc) and raw JSON under `results/`.
 
 ## Key Features

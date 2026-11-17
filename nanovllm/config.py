@@ -7,6 +7,8 @@ from transformers import AutoConfig
 @dataclass(slots=True)
 class Config:
     model: str # 模型所在目录
+    linear_backend: str = "torch" # torch | cuda[_auto] | cuda_fp8[_auto] | cuda_decode[_auto]; Qwen3 TP=1
+    cuda_linear_tuning: str = "" # frozen per-shape selector JSON
     max_num_batched_tokens: int = 16384 # 一次批处理的最大token数
     max_num_seqs: int = 512 # 最多同时处理序列数
     max_model_len: int = 4096 # 最大上下文长度
@@ -75,6 +77,9 @@ class Config:
     mixed_cudagraph_max_tokens: int = 4096 # 超过该批次token数时走eager，限制图捕获峰值显存
 
     def __post_init__(self):
+        assert self.linear_backend in ("torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto")
+        if self.linear_backend.endswith("auto"):
+            assert self.cuda_linear_tuning, "auto CUDA linear requires a frozen cuda_linear_tuning report"
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
@@ -150,12 +155,20 @@ class Config:
         if self.speculative == "eagle":
             assert self.eagle_path, "speculative=eagle requires eagle_path"
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.linear_backend != "torch":
+            assert self.hf_config.model_type == "qwen3" and self.tensor_parallel_size == 1, "CUDA linear currently requires Qwen3 TP=1"
+            assert self.execution_mode != "pd", "CUDA linear currently requires mixed execution"
+            assert self.quantization == "none", "CUDA linear cannot combine with weight quantization"
+            if self.linear_backend.startswith("cuda_fp8"):
+                assert str(self.hf_config.dtype) == "torch.bfloat16", "native FP8 linear requires BF16 model"
         self.hf_config.moe_int4_backend = self.moe_int4_backend
         self.hf_config.moe_int4_fuse_gate_up = self.moe_int4_fuse_gate_up
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
 
     def pd_mode_incompatibility(self) -> str | None:
         """Return why PD mode cannot run with this configuration, if applicable."""
+        if self.linear_backend != "torch":
+            return "CUDA linear currently requires mixed execution"
         if self.tensor_parallel_size != 1:
             return "PD separation requires tensor_parallel_size=1"
         if self.speculative != "none":

@@ -30,3 +30,6 @@ Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]
+
+[tool.setuptools.package-data]
+nanovllm = ["layers/csrc/*.cu", "layers/cuda_decode_sm120.json"]

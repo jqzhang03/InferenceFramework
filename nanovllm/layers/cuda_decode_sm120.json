@@ -1,0 +1,137 @@
+{
+  "device": "NVIDIA GeForce RTX 5060 Ti",
+  "backend": "cuda_decode",
+  "selectors": {
+    "1,4096,1024": {
+      "mode": "gemv",
+      "config": 0
+    },
+    "1,1024,2048": {
+      "mode": "gemv",
+      "config": 0
+    },
+    "1,6144,1024": {
+      "mode": "gemv",
+      "config": 0
+    },
+    "1,1024,3072": {
+      "mode": "gemv",
+      "config": 0
+    },
+    "4,4096,1024": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "4,1024,2048": {
+      "mode": "decode",
+      "config": 5
+    },
+    "4,6144,1024": {
+      "mode": "gemm",
+      "config": 21
+    },
+    "4,1024,3072": {
+      "mode": "decode",
+      "config": 8
+    },
+    "8,4096,1024": {
+      "mode": "gemm",
+      "config": 22
+    },
+    "8,1024,2048": {
+      "mode": "decode",
+      "config": 5
+    },
+    "8,6144,1024": {
+      "mode": "gemm",
+      "config": 22
+    },
+    "8,1024,3072": {
+      "mode": "decode",
+      "config": 8
+    },
+    "16,4096,1024": {
+      "mode": "gemm",
+      "config": 22
+    },
+    "16,1024,2048": {
+      "mode": "decode",
+      "config": 5
+    },
+    "16,6144,1024": {
+      "mode": "gemm",
+      "config": 21
+    },
+    "16,1024,3072": {
+      "mode": "decode",
+      "config": 12
+    },
+    "32,4096,1024": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "32,1024,2048": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "32,6144,1024": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "32,1024,3072": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "128,4096,1024": {
+      "mode": "gemm",
+      "config": 16
+    },
+    "128,1024,2048": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "128,6144,1024": {
+      "mode": "gemm",
+      "config": 11
+    },
+    "128,1024,3072": {
+      "mode": "gemm",
+      "config": 23
+    },
+    "512,4096,1024": {
+      "mode": "gemm",
+      "config": 11
+    },
+    "512,1024,2048": {
+      "mode": "gemm",
+      "config": 17
+    },
+    "512,6144,1024": {
+      "mode": "gemm",
+      "config": 10
+    },
+    "512,1024,3072": {
+      "mode": "gemm",
+      "config": 17
+    },
+    "1024,4096,1024": {
+      "mode": "gemm",
+      "config": 11
+    },
+    "1024,1024,2048": {
+      "mode": "gemm",
+      "config": 17
+    },
+    "1024,6144,1024": {
+      "mode": "gemm",
+      "config": 10
+    },
+    "1024,1024,3072": {
+      "mode": "gemm",
+      "config": 5
+    }
+  },
+  "selection_policy": "M=1 retains old GEMV; M>1 enables new path only if training rotating-weight time improves >=2%",
+  "dtype": "bfloat16",
+  "source": "2026-11-16 Qwen3-0.6B, rotating 28 weight buffers; other devices/dtypes/shapes retain legacy dispatch"
+}

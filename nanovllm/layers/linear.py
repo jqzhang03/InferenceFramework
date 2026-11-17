@@ -856,7 +856,8 @@ class ReplicatedLinear(LinearBase):
             return self._nvfp4_forward(x)
         if self.w8a8:
             return self._w8a8_forward(x)
-        return F.linear(x, self.weight, self.bias)
+        custom = getattr(self, "_cuda_linear", None)
+        return custom(x, self.bias) if custom is not None else F.linear(x, self.weight, self.bias)
 
 
 class ColumnParallelLinear(LinearBase):
@@ -888,7 +889,8 @@ class ColumnParallelLinear(LinearBase):
             return self._nvfp4_forward(x)
         if self.w8a8:
             return self._w8a8_forward(x)
-        return F.linear(x, self.weight, self.bias)
+        custom = getattr(self, "_cuda_linear", None)
+        return custom(x, self.bias) if custom is not None else F.linear(x, self.weight, self.bias)
 
 
 class MergedColumnParallelLinear(ColumnParallelLinear):
@@ -979,7 +981,9 @@ class RowParallelLinear(LinearBase):
         elif self.w8a8:
             y = self._w8a8_forward(x)
         else:
-            y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
+            bias = self.bias if self.tp_rank == 0 else None
+            custom = getattr(self, "_cuda_linear", None)
+            y = custom(x, bias) if custom is not None else F.linear(x, self.weight, bias)
         if self.tp_size > 1:
             dist.all_reduce(y)
         return y

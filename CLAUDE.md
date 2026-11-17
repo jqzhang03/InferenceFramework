@@ -1,5 +1,40 @@
 # CLAUDE.md
 
+Current cuda_decode full breakdown: --nsys --suite decode-current restores default
+scheduler/multi-step/mixed Graph flags with explicit resource caps, captures five
+fresh Windows-readable traces, and marks initialization/warmup separately.
+--full-nsys-report emits non-overlapping leaf GPU attribution, phase/component
+CSV/JSON and benchmarks/_qwen_decode_full_nsys_20261116.md. Keep Mixed as its own
+phase, GPU activity union separate from CPU inclusive ranges, and eager hook
+diagnostics separate from graph performance. Preserve old trace directories.
+
+CUDA Decode optimization: cuda_decode.cu has 23 normal configs plus diagnostic
+cfg23 (no swizzle). Runtime cuda_decode selects the packaged BF16 RTX 5060 Ti
+profile; measured O/down projections use NT MMA + shared reuse/optional FP32
+Split-K, while M=1 and QKV/gate-up retain old dispatch. Tests cover FP16/BF16,
+tails, changing-input graph replay and default bundled routing. Helpers:
+--decode-study / --decode-pytest / --decode-report. Keep rotating-weight held-out
+measurements separate from warm-cache tuning and nsys wall times. Sanitizer was
+blocked by the WDDM debugger interface; bank conflicts are greatly reduced but
+not universally zero. See benchmarks/_cuda_decode_reuse_20261116.md.
+
+Qwen new-CUDA Nsight Systems traces: run_qwen_cuda.sh --nsys --output <fresh-dir>,
+then --nsys-report --root <dir>. qwen_cuda_nsys.py captures graph nodes and a
+marked nsys_capture window; eager adds CPU module NVTX hooks only. Report GPU
+kernel durations separately from CPU API wait and GPU idle intervals. Raw Windows
+.nsys-rep/SQLite/JSON remain under profiles/; the dated report is
+benchmarks/_qwen_cuda_nsys_20261116.md. Existing directories are not overwritten.
+
+Qwen3 CUDA decoder projections are opt-in via Config.linear_backend
+(torch/cuda/cuda_auto/cuda_fp8/cuda_fp8_auto), installed before graph capture.
+Only TP=1 mixed execution without existing weight quantization is supported.
+Runtime kernels are packaged under nanovllm/layers/csrc; the original standalone
+benchmark config IDs remain historical. GEMV/small-M tiles and FP8 per-row
+quantization are runtime additions. Auto variants require matching frozen
+selectors to use CUDA on measured shapes; unseen shapes fall back to PyTorch.
+FP8 changes precision. See benchmarks/_qwen_cuda_linear_20261116.md and
+tests/test_cuda_linear.py; preserve separate kernel and end-to-end claims.
+
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 ## Project overview
