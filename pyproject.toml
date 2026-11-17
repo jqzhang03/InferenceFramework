@@ -32,4 +32,5 @@ where = ["."]
 include = ["nanovllm*"]
 
 [tool.setuptools.package-data]
-nanovllm = ["layers/csrc/*.cu", "layers/cuda_decode_sm120.json"]
+nanovllm = ["layers/csrc/*.cu", "layers/cuda_decode_sm120.json",
+            "layers/cuda_decode_sm120_fp16.json", "layers/cuda_fp8_sm120.json"]

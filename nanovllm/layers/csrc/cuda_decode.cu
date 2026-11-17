@@ -144,7 +144,14 @@ __global__ void decode_simt_kernel(const unsigned short* x,const unsigned short*
  X(3,128,8,64,4,2,1) X(4,32,8,64,2,2,1) X(5,64,8,128,4,2,1) \
  X(6,64,8,64,4,2,2) X(7,64,8,64,4,2,4) X(8,64,8,64,4,2,8) \
  X(9,128,8,64,4,2,4) X(10,32,8,64,2,2,4) X(11,64,16,64,4,2,1) \
- X(12,64,16,64,4,2,4) X(13,64,8,128,4,2,4)
+ X(12,64,16,64,4,2,4) X(13,64,8,128,4,2,4) \
+ X(24,32,8,64,1,2,1) X(25,32,8,128,1,2,1) \
+ X(26,64,8,64,2,2,1) X(27,64,8,128,2,2,1) \
+ X(28,64,8,64,2,3,1) X(29,64,8,128,2,3,1) \
+ X(30,32,8,128,1,3,1) X(31,32,8,64,1,2,2) \
+ X(32,64,8,64,2,2,2) X(33,64,8,128,2,2,2) \
+ X(34,32,8,64,1,2,4) X(35,64,8,64,2,2,4) \
+ X(36,64,8,64,2,4,1) X(37,64,16,64,2,2,1)
 template<bool BF,int BN,int BM,int BK,int WARPS,int ST,int SPLIT,bool SWIZZLE=true>
 void launch(torch::Tensor x,torch::Tensor w,torch::Tensor out) {
     int M=x.size(0),N=w.size(0),K=x.size(1);auto stream=at::cuda::getCurrentCUDAStream();
@@ -175,18 +182,30 @@ template<bool BF> void dispatch(torch::Tensor x,torch::Tensor w,torch::Tensor ou
         default:TORCH_CHECK(false,"invalid decode config");
     }
 }
-void decode_out(torch::Tensor x,torch::Tensor w,torch::Tensor out,int64_t cfg) {
+void decode_impl(torch::Tensor x,torch::Tensor w,torch::Tensor out,int64_t cfg,bool no_swizzle) {
     TORCH_CHECK(x.is_cuda() && w.device()==x.device() && out.device()==x.device(),"CUDA device mismatch");
     TORCH_CHECK(x.dim()==2 && w.dim()==2 && out.dim()==2 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous(),"contiguous matrices required");
     TORCH_CHECK(x.scalar_type()==w.scalar_type() && x.scalar_type()==out.scalar_type() && (x.scalar_type()==at::kHalf || x.scalar_type()==at::kBFloat16),"FP16/BF16 required");
     TORCH_CHECK(x.size(1)==w.size(1) && out.size(0)==x.size(0) && out.size(1)==w.size(0) && x.size(1)%8==0,"invalid shape");
-    TORCH_CHECK(x.size(0)<=32 && cfg>=0 && cfg<24,"small-M requires M<=32 and config 0..23");
+    TORCH_CHECK(x.size(0)<=32 && cfg>=0 && cfg<38,"small-M requires M<=32 and config 0..37");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr())%16==0 && reinterpret_cast<uintptr_t>(w.data_ptr())%16==0,"16-byte alignment required");
     TORCH_CHECK(!out.is_alias_of(x) && !out.is_alias_of(w),"output aliases inputs");
     const c10::cuda::CUDAGuard guard(x.device());
     if(!out.numel())return;
     if(!x.size(1)){out.zero_();return;}
-    if(x.scalar_type()==at::kBFloat16)dispatch<true>(x,w,out,cfg);else dispatch<false>(x,w,out,cfg);
+    if(no_swizzle) {
+        // Controlled layout ablation: identical geometry and instruction mapping.
+        #define NOSW(ID,BN,BM,BK,WARPS,ST,SPLIT) case ID: \
+            if(x.scalar_type()==at::kBFloat16)launch<true,BN,BM,BK,WARPS,ST,SPLIT,false>(x,w,out); \
+            else launch<false,BN,BM,BK,WARPS,ST,SPLIT,false>(x,w,out);break;
+        switch(cfg) {MMA_CONFIGS(NOSW) default:TORCH_CHECK(false,"MMA config required for layout diagnostic");}
+        #undef NOSW
+    } else if(x.scalar_type()==at::kBFloat16)dispatch<true>(x,w,out,cfg);else dispatch<false>(x,w,out,cfg);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
-PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {m.def("decode_out",&decode_out);}
+void decode_out(torch::Tensor x,torch::Tensor w,torch::Tensor out,int64_t cfg) {decode_impl(x,w,out,cfg,false);}
+void decode_no_swizzle_out(torch::Tensor x,torch::Tensor w,torch::Tensor out,int64_t cfg) {decode_impl(x,w,out,cfg,true);}
+PYBIND11_MODULE(TORCH_EXTENSION_NAME,m) {
+    m.def("decode_out",&decode_out);
+    m.def("decode_no_swizzle_out",&decode_no_swizzle_out);
+}

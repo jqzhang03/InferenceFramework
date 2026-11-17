@@ -7,7 +7,7 @@ from transformers import AutoConfig
 @dataclass(slots=True)
 class Config:
     model: str # 模型所在目录
-    linear_backend: str = "torch" # torch | cuda[_auto] | cuda_fp8[_auto] | cuda_decode[_auto]; Qwen3 TP=1
+    linear_backend: str | None = None # None: model default (Qwen3-0.6B -> cuda_decode); explicit torch/cuda variants override
     cuda_linear_tuning: str = "" # frozen per-shape selector JSON
     max_num_batched_tokens: int = 16384 # 一次批处理的最大token数
     max_num_seqs: int = 512 # 最多同时处理序列数
@@ -77,8 +77,8 @@ class Config:
     mixed_cudagraph_max_tokens: int = 4096 # 超过该批次token数时走eager，限制图捕获峰值显存
 
     def __post_init__(self):
-        assert self.linear_backend in ("torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto")
-        if self.linear_backend.endswith("auto"):
+        assert self.linear_backend in (None, "torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto")
+        if self.linear_backend is not None and self.linear_backend.endswith("auto"):
             assert self.cuda_linear_tuning, "auto CUDA linear requires a frozen cuda_linear_tuning report"
         assert os.path.isdir(self.model)
         assert self.kvcache_block_size % 256 == 0
@@ -155,6 +155,8 @@ class Config:
         if self.speculative == "eagle":
             assert self.eagle_path, "speculative=eagle requires eagle_path"
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.linear_backend is None:
+            self.linear_backend = self._default_linear_backend()
         if self.linear_backend != "torch":
             assert self.hf_config.model_type == "qwen3" and self.tensor_parallel_size == 1, "CUDA linear currently requires Qwen3 TP=1"
             assert self.execution_mode != "pd", "CUDA linear currently requires mixed execution"
@@ -164,6 +166,21 @@ class Config:
         self.hf_config.moe_int4_backend = self.moe_int4_backend
         self.hf_config.moe_int4_fuse_gate_up = self.moe_int4_fuse_gate_up
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
+
+    def _default_linear_backend(self) -> str:
+        """Select the Qwen3-0.6B default by architecture, independent of directory name."""
+        hf = self.hf_config
+        shape = tuple(getattr(hf, key, None) for key in (
+            "hidden_size", "intermediate_size", "num_hidden_layers",
+            "num_attention_heads", "num_key_value_heads", "head_dim"))
+        compatible = (self.tensor_parallel_size == 1 and self.execution_mode != "pd"
+                      and self.quantization == "none")
+        dtype = str(getattr(hf, "dtype", None))
+        if (getattr(hf, "model_type", None) == "qwen3"
+                and shape == (1024, 3072, 28, 16, 8, 128) and compatible
+                and dtype in ("torch.float16", "torch.bfloat16", "float16", "bfloat16")):
+            return "cuda_decode"
+        return "torch"
 
     def pd_mode_incompatibility(self) -> str | None:
         """Return why PD mode cannot run with this configuration, if applicable."""

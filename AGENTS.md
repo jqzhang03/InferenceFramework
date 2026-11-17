@@ -1,5 +1,46 @@
 # Repository Guidelines
 
+### Custom-only CUDA profiling (2026-11-17)
+
+`run_qwen_cuda.sh --operator-profile --output <fresh-dir>` runs independent
+timings, eager/graph Nsight Systems capture and warm/flushed-cache Nsight Compute
+capture for runtime CUDA projection kernels. `--operator-pytest` checks attribution
+and multi-kernel CSV units. Formal ranges are `op_capture/`; initialization and
+FP64 references are outside them. Keep Split-K finish and FP8 pack kernels.
+DeepSeek floating-point shapes are standalone probes, not deployed INT4 MoE.
+Use three-seed graph timings for performance, not NCU replay durations; active
+GPU span is not occupancy. Preserve native .nsys-rep/.ncu-repz, raw units and logs.
+See benchmarks/_cuda_operator_profile_20261117.md. Runtime kernels/selectors unchanged.
+
+### Qwen3-0.6B default linear backend (2026-11-17)
+
+Config.linear_backend=None resolves after loading HF metadata: FP16/BF16 Qwen3
+with (hidden/intermediate/layers/Q heads/KV heads/head_dim) =
+(1024,3072,28,16,8,128), TP=1, no weight quantization and no explicit PD uses
+cuda_decode. Other combinations resolve to torch; explicit backends always win.
+This applies to LLM, create_app and the server CLI; --linear-backend torch restores
+the library baseline, and --cuda-linear-tuning supplies frozen selectors.
+Default CUDA prevents execution_mode=auto from choosing PD; explicit PD retains
+torch by default. Config tests: run_qwen_cuda.sh --config-pytest (17 passed).
+--decode-pytest passed seven GPU tests including real default-backend Qwen3-0.6B
+generation (112 adapters, eight requests x four tokens, decode graph replay).
+Historical benchmark reports retain their original explicit backends and results.
+
+### cfg22 Nsight Compute diagnosis (2026-11-17)
+
+`run_qwen_cuda.sh --cfg22-ncu` runs the isolated timing/counter harness;
+`--cfg22-pytest` validates diagnostic A swizzle in FP16/BF16 with graph replay,
+and `--cfg22-report` renders benchmarks/_cfg22_ncu_20261117.md. Raw results remain
+under results/cfg22_ncu_20261116/ (38 isolated + two in-model application replays).
+Runtime cuda_gemm diagnostic variant14 retains cfg22 geometry while changing
+only A swizzle; it is not normal cfg14 and is not deployed. Normal cfg22 and
+selectors are unchanged. BF16 B8 model QKV/gate-up L2 hits are 8.35%/8.70% and
+DRAM reaches 81.54%/85.09% of NCU sustained peak. The measured streaming path is
+primarily weight-bandwidth limited; warm-cache grid/latency/shared conflicts
+must be evaluated separately. Do not use NCU replay timings as benchmark wins.
+Use timing_amortized.json (three seeds), not the early single-node timing.json
+pilot. NCU native output is compressed .ncu-repz; preserve reports and raw units.
+
 ### Current Decode full inference profiling (2026-11-16)
 
 `run_qwen_cuda.sh --nsys --suite decode-current --output <fresh-dir>` profiles
@@ -23,8 +64,9 @@ uint4 shared vectors and 8/16/32-lane shuffle reduction. Configs 0–22 are norm
 23 is no-swizzle diagnostic only. `linear_backend="cuda_decode"` automatically
 loads cuda_decode_sm120.json on RTX 5060 Ti BF16; otherwise it retains legacy
 dispatch unless supplied matching selectors. Only measured winning O/down shapes
-enable new kernels; M=1 and QKV/gate-up keep previous kernels. Defaults remain
-torch. FP16/BF16 correctness and graph replay are GPU tested; TP=1 mixed only.
+enable new kernels; M=1 and QKV/gate-up keep previous kernels. The initial rollout
+was opt-in; the 2026-11-17 Qwen3-0.6B default is described above.
+FP16/BF16 correctness and graph replay are GPU tested; TP=1 mixed only.
 `cuda_decode_study.py` tunes, validates rotating 28 weights, freezes deployment,
 replays model pairs and collects ncu/nsys; helper flags are --decode-study,
 --decode-pytest, --decode-report. Keep dated raw results and old kernels intact.
@@ -47,8 +89,8 @@ See benchmarks/_qwen_cuda_nsys_20261116.md; GPU active union is not occupancy,
 and long cudaMemcpyAsync CPU duration may be GPU wait rather than transfer time.
 
 `nanovllm/layers/cuda_linear.py` installs per-layer adapters in ModelRunner before
-warmup/capture. Config.linear_backend defaults to torch; cuda/cuda_auto and
-cuda_fp8/cuda_fp8_auto are opt-in, Qwen3 TP=1 mixed execution only, without other
+warmup/capture. Config.linear_backend resolves the Qwen3-0.6B default described
+above; cuda/cuda_auto and cuda_fp8/cuda_fp8_auto remain opt-in, Qwen3 TP=1 mixed execution only, without other
 weight quantization. The decoder's QKV/O and MLP projections are covered; the
 tied LM head and FlashAttention are unchanged. Runtime sources live in
 layers/csrc and are packaged; standalone benchmark sources retain their historical

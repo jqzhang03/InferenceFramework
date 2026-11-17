@@ -2231,6 +2231,72 @@ eager 叶子模块通过 launch correlation ID 归因，避免父子重复：每
 `profiles/qwen_decode_full_nsys_20261116/`。复现入口 `--nsys --suite decode-current`
 与 `--full-nsys-report`，均使用新目录保留历史。本次没有修改算子或引擎实现。
 
+### 10.3.30 2026-11-17 cfg22 的 Nsight Compute 计数器诊断
+
+在 RTX 5060 Ti / BF16 / B=8 下，对 QKV `(8,4096,1024)` 与 gate/up
+`(8,6144,1024)` 完成 36 份主对照、2 份形状控制和 2 份实际模型 application replay。
+主对照为原 cfg22 / 仅改 A swizzle 的 diagnostic variant14 / PyTorch，分别测量
+热缓存与逐 pass 清空缓存，每组 3 次。普通 cfg22 和线上 selector 没有修改。
+
+真实模型第 14 层（0-based）QKV/gate-up 的 L2 命中率为 8.35%/8.70%，
+DRAM 吞吐达到 NCU sustained peak 的 81.54%/85.09%，读取约 8.40/12.60 MB。
+结合冷缓存约 377/386 GB/s 和轮换 28 份权重的测量，主要限制是权重读取带宽。
+这是两个模型位置的计数器快照，不是整模型跨层统计或端到端加速结果。
+
+热缓存还有并行度和 shared 依赖问题：QKV 仅 32 CTA、少于 36 SM；gate/up 48 CTA，
+每 CTA 4 warp，achieved occupancy 约 8.3%/11.2%。N 翻倍到 8192 后热缓存 Tensor
+active 从 16.2% 到 37.2%，独立时延仅 13.287→14.776 μs，支持小 grid 的限制；
+不能单靠 occupancy 低断言瓶颈。M 从 8 到 16 仍使用同一物理 M16 MMA tile。
+
+A swizzle 对照把热缓存 QKV shared-load conflicts 从 32,768 降到 0，gate/up
+从 49,153 降至约 7。非 NCU、三个种子的独立时延中，QKV 热缓存 13.287→12.516 μs
+（约 5.8%），但 rotating28 为 21.889→22.189 μs；gate/up rotating28 为
+32.601→32.622 μs，未显示收益。因此 shared bank-conflict 不是实际解码的首要限制。
+后续应以轮换权重/完整模型为选型门槛；降低权重字节量或提高 batch 的方案需要独立验证。
+
+诊断 FP16/BF16、四个尺寸与更改输入后的 Graph replay 测试为 2 passed；未建立模型质量结论。
+报告：[cfg22 诊断](benchmarks/_cfg22_ncu_20261117.md)。原始 CSV、JSON 和压缩
+`.ncu-repz` 保留在 `results/cfg22_ncu_20261116/`，续测在 2026-11-17 完成。
+复现入口为 `--cfg22-ncu` / `--cfg22-pytest` / `--cfg22-report`；计时使用
+`timing_amortized.json`，不使用早期单节点 pilot 或 NCU replay 耗时来声称性能收益。
+
+### 10.3.31 2026-11-17 Qwen3-0.6B 默认启用 cuda_decode
+
+未指定 `linear_backend` 时，根据 HF 架构配置选择默认值：Qwen3-0.6B 的
+hidden/intermediate/layers/Q heads/KV heads/head_dim 为 1024/3072/28/16/8/128，
+FP16/BF16、TP=1、无权重量化、非显式 PD 时使用 `cuda_decode`。
+其他模型或不兼容组合默认 `torch`；显式后端优先，不按目录名称猜测模型。
+`LLM(model)` 和服务入口使用同一 Config 解析逻辑，CLI 新增 `--linear-backend`
+及 `--cuda-linear-tuning`；`linear_backend="torch"` 可恢复调库基线。
+默认 CUDA 后端使 `execution_mode="auto"` 保持 mixed；显式 `torch` 才能重新自动选择 PD。
+
+配置回归 17 passed，覆盖默认、显式覆盖、其他模型、量化/TP/PD 回退和非法组合。
+CUDA Decode/Linear 回归 7 passed，包含真实 Qwen3-0.6B 不传后端时的 112 个投影适配器、
+8 请求各生成 4 token，以及 Decode CUDA Graph replay。未重新测量吞吐或模型质量，
+历史性能数字仍对应各自报告中的显式后端。本次仅修改默认选择，算子与冻结 selector 未改。
+
+### 10.3.32 2026-11-17 自研 CUDA 算子的独立 profiling
+
+`benchmarks/cuda_operator_profile.py` 不运行模型，覆盖 44 个 GEMM/GEMV、
+Decode MMA/Split-K 与 FP8 量化＋GEMM 算例；三种 seed × resident/rotating28
+得到 264 组独立计时，并采集 eager/graph 两份 Systems 与 54 份 Compute 报告。
+DeepSeek 只使用真实尺寸测试浮点 kernel，不代表部署的 INT4 MoE。
+NVTX 范围 `op_capture/` 按 CUDA API correlation ID 归属 GPU kernel，
+核对 Graph 节点、Split-K finish 和 FP8 pack 的完整调用次数；解析回归四项通过。
+
+BF16 M=8 QKV、gate-up 的冷条件 DRAM 吞吐为 NCU sustained peak 的
+85.61%/88.11%，优化 shared 冲突仍需看 rotating28，而非仅看 warm-cache。
+O 投影仅 16 CTA；FP16 M=8 down 仍走 cfg10，63.143 μs，
+BF16 的 Decode/8 为 17.216 μs（两者配置不同，不是同配置 dtype 对照）。
+下一步优先验证小 M tile、适度 Split-K 和 FP16 selector。
+Prefill gate-up Tensor 活动约 78.35%，FP8 pack 占其 Graph resident 操作
+kernel 时间约 7.75%；继续按主 kernel 的流水/寄存器/布局进行对照。
+本轮未改运行时 kernel/selector，无调库基线或模型推理加速结论。
+
+详见 [独立算子报告](benchmarks/_cuda_operator_profile_20261117.md)；
+原生报告和原始数据在 `profiles/cuda_operator_20261117/`。
+复现：`bash benchmarks/run_qwen_cuda.sh --operator-profile --output <fresh-dir>`。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：

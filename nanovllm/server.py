@@ -1569,6 +1569,11 @@ async def _empty_context():
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the nano-vLLM OpenAI-compatible server")
+    parser.add_argument("--linear-backend", default=None,
+                        choices=("torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto"),
+                        help="Projection backend; default: cuda_decode for compatible Qwen3-0.6B, otherwise torch")
+    parser.add_argument("--cuda-linear-tuning", default="",
+                        help="Frozen CUDA projection selector JSON (required for *_auto backends)")
     parser.add_argument("model", help="local Hugging Face model directory")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -1651,6 +1656,8 @@ def main() -> None:
     app = create_app(
         args.model,
         engine_kwargs={
+            "linear_backend": args.linear_backend,
+            "cuda_linear_tuning": args.cuda_linear_tuning,
             "execution_mode": args.execution_mode,
             "tensor_parallel_size": args.tensor_parallel_size,
             "max_model_len": args.max_model_len,

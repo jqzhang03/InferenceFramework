@@ -4,8 +4,9 @@
 
 # Nano-vLLM
 
-**Decode projection optimization:** `LLM(model, linear_backend="cuda_decode")`
-uses a bundled RTX 5060 Ti / BF16 selector for Qwen3-0.6B. It enables shared-tile
+**Default Qwen3-0.6B projections:** `LLM(model)` selects `linear_backend="cuda_decode"`
+for FP16/BF16 Qwen3-0.6B with TP=1 and no weight quantization or explicit PD mode.
+The backend uses a bundled RTX 5060 Ti / BF16 selector. It enables shared-tile
 weight reuse and transposed MMA on measured small batches, including FP32 Split-K
 reduction where beneficial. Other shapes/dtypes/devices retain the legacy CUDA
 dispatch. TP=1 mixed execution without other weight quantization is required.
@@ -21,14 +22,29 @@ This emits five Windows `.nsys-rep` traces plus phase/component CSV and JSON;
 startup, warmup and steady inference are marked separately. See the
 [full inference breakdown](benchmarks/_qwen_decode_full_nsys_20261116.md).
 
-Qwen3 TP=1 supports opt-in CUDA decoder projections:
+The [cfg22 Nsight Compute diagnosis](benchmarks/_cfg22_ncu_20261117.md)
+includes 38 isolated captures and two in-model captures. At BF16 batch=8, model
+QKV/gate-up reaches 81.5%/85.1% of the tool's sustained DRAM peak with only
+8.4%/8.7% L2 hits. Removing A shared-memory conflicts improved resident-weight
+QKV timing by 5.8% but did not improve rotating-weight timing. The diagnostic
+does not change deployment selectors. Reproduce with `--cfg22-ncu`,
+`--cfg22-pytest`, and `--cfg22-report` in `benchmarks/run_qwen_cuda.sh`;
+the native reports are compressed `.ncu-repz` for Nsight Compute UI.
+
+Qwen3 TP=1 also supports explicitly selected CUDA decoder projections:
 `LLM(model, linear_backend="cuda")` uses FP16/BF16;
 `linear_backend="cuda_fp8"` uses experimental native FP8 with a BF16 model on SM120.
 QKV/O and MLP projections are replaced; FlashAttention and the vocabulary head
 keep their existing paths. Compilation and weight packing happen before CUDA
 Graph capture. Extra transposed/FP8 weight buffers consume GPU memory. Existing
 weight quantization, PD and TP>1 cannot be combined with this backend.
-The default is still `linear_backend="torch"`.
+Other model architectures, dtypes and incompatible configurations default to
+`linear_backend="torch"`. Defaults are selected from model architecture metadata,
+independent of the checkpoint directory name; explicit backends take precedence.
+Use `LLM(model, linear_backend="torch")` or
+`nanovllm-serve /path/to/model --linear-backend torch` for the library baseline.
+`execution_mode="auto"` keeps this default CUDA backend in mixed mode; select
+`torch` explicitly to restore automatic multi-GPU PD selection.
 
 Tune with `bash benchmarks/run_qwen_cuda.sh --backend cuda --output results/qwen_cuda_bf16_tune.json`,
 then pass `cuda_linear_tuning=...`. `cuda_auto` / `cuda_fp8_auto` accept matching
@@ -934,6 +950,31 @@ errors separately. The report retains per-shape results and limits; these are
 operator measurements on this GPU, not end-to-end serving gains. CUDA 12.8+ and
 an sm_120a build are required. Native E5M2 correctness is checked separately;
 performance results cover E4M3 only.
+
+### Custom CUDA operators: isolated profiling
+
+```bash
+bash benchmarks/run_qwen_cuda.sh --operator-profile --output profiles/cuda_operator_NEW
+bash benchmarks/run_qwen_cuda.sh --operator-pytest
+```
+
+This harness times the runtime CUDA GEMM/GEMV, Decode MMA/Split-K and FP8
+activation-pack + GEMM paths without loading a model or benchmarking libraries.
+It covers FP16/BF16 Qwen projection shapes and standalone DeepSeek floating-point
+shapes; the latter do not represent the deployed INT4 MoE path. Weight packing
+and FP64 reference checks run outside measured scopes. Three seeds compare one
+reused weight with 28 rotating weights. Outputs include independent CUDA Graph
+timings, eager/graph `.nsys-rep` timelines, warm/flushed-cache `.ncu-repz` reports,
+raw CSV, `summary.json`, and `REPORT.md`. In Systems, filter `op_capture/`.
+
+Use `--mode timing|nsys|ncu|report` for separate stages, `--resume` for successful
+captures or partial timings with unchanged sources/configuration,
+`--case qwen_bf16_m8_down` for one case, or
+`--suite qwen --dtypes bf16 --no-fp8` for a reduced suite. NCU samples selected
+representative cases three times in each cache regime; explicit `--case` samples
+every selected case. Split-K finish and FP8 pack kernels are retained. NCU replay
+durations are diagnostic; use the independent timings to evaluate changes.
+See the [2026-11-17 profiling report](benchmarks/_cuda_operator_profile_20261117.md).
 
 ## License
 

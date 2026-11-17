@@ -208,6 +208,19 @@ template<bool BF> void dispatch(torch::Tensor a, torch::Tensor b, torch::Tensor 
         CASE(21,16,64,32,16,32,2);
         CASE(22,16,128,32,16,32,2);
         CASE(23,32,64,32,16,32,2);
+        CASE(24,16,128,32,16,32,3);
+        CASE(25,16,128,32,16,32,4);
+        CASE(26,16,64,32,16,32,3);
+        CASE(27,32,64,32,16,32,3);
+        // Same cfg10/cfg17 geometry, alternate A swizzle; old IDs stay intact.
+        case 28: launch<BF,64,128,32,32,64,2,true>(ap,bp,cp,M,N,K,stream,extra_smem);break;
+        case 29: launch<BF,64,128,32,32,64,3,true>(ap,bp,cp,M,N,K,stream,extra_smem);break;
+        case 30: launch<BF,64,128,32,64,32,2,true>(ap,bp,cp,M,N,K,stream,extra_smem);break;
+        case 31: launch<BF,16,128,32,16,32,2,true>(ap,bp,cp,M,N,K,stream,extra_smem);break;
+        CASE(32,64,128,64,32,64,2);
+        CASE(33,64,64,64,32,32,2);
+        CASE(34,64,128,64,64,32,2);
+        CASE(35,32,128,32,32,32,2);
         default: TORCH_CHECK(false,"unknown config");
     }
     #undef CASE
@@ -215,7 +228,7 @@ template<bool BF> void dispatch(torch::Tensor a, torch::Tensor b, torch::Tensor 
 
 void gemm_out(torch::Tensor a, torch::Tensor b, torch::Tensor c, int64_t config) {
     validate(a,b,c);
-    TORCH_CHECK(config >= 0 && config < 24, "config must be in [0, 24)");
+    TORCH_CHECK(config >= 0 && config < 36, "config must be in [0, 36)");
     const c10::cuda::CUDAGuard guard(a.device());
     TORCH_CHECK(at::cuda::getDeviceProperties(a.get_device())->major >= 8, "SM80+ required");
     if(a.scalar_type()==at::kHalf) dispatch<false>(a,b,c,config);

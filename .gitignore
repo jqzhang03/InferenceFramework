@@ -204,3 +204,6 @@ draft_*
 !tests/test_cuda_linear.py
 !tests/test_cuda_decode.py
 !tests/test_cuda_cfg22_diag.py
+!tests/test_linear_backend_default.py
+!tests/test_cuda_operator_profile.py
+!tests/test_cuda_pipeline.py

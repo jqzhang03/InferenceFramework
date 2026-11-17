@@ -96,11 +96,19 @@ def install_cuda_linears(model: torch.nn.Module, backend: str, tuning_path: str 
     fp8_ext = load_extension(True) if backend.startswith("cuda_fp8") else None
     decode_ext = load_decode_extension() if backend.startswith("cuda_decode") else None
     selectors = {}
-    if backend == "cuda_decode" and not tuning_path:
-        bundled = json.loads(Path(__file__).with_name("cuda_decode_sm120.json").read_text())
-        if (bundled["device"] == torch.cuda.get_device_name()
-                and next(model.parameters()).dtype == torch.bfloat16):
-            selectors = bundled["selectors"]
+    if not tuning_path:
+        dtype = next(model.parameters()).dtype
+        filename = None
+        if backend == "cuda_decode":
+            filename = {torch.bfloat16: "cuda_decode_sm120.json",
+                        torch.float16: "cuda_decode_sm120_fp16.json"}.get(dtype)
+        elif backend == "cuda_fp8" and dtype == torch.bfloat16:
+            filename = "cuda_fp8_sm120.json"
+        path = Path(__file__).with_name(filename) if filename else None
+        if path is not None and path.exists():
+            bundled = json.loads(path.read_text())
+            if bundled["device"] == torch.cuda.get_device_name() and bundled["backend"] == backend:
+                selectors = bundled["selectors"]
     if tuning_path:
         report = json.loads(Path(tuning_path).read_text())
         if report["device"] != torch.cuda.get_device_name() or report["backend"] != backend:

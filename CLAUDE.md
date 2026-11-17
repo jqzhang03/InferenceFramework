@@ -1,5 +1,33 @@
 # CLAUDE.md
 
+Custom-only CUDA profiling: run_qwen_cuda.sh --operator-profile --output <fresh-dir>
+collects independent three-seed resident/rotating28 timings, eager/graph Systems
+timelines and warm/flushed-cache Compute counters. --operator-pytest validates
+NVTX filtering and multi-kernel CSV units. Filter op_capture/; retain FP8 pack and
+Split-K finish. DeepSeek float shapes do not represent deployed INT4 inference.
+See benchmarks/_cuda_operator_profile_20261117.md; native artifacts remain under
+profiles/cuda_operator_20261117/. No kernel or selector change.
+
+Qwen3-0.6B default (2026-11-17): omitted/None linear_backend now resolves to
+cuda_decode by HF architecture (1024/3072/28/16/8/128), FP16/BF16, TP=1,
+quantization=none and execution_mode!=pd. Other combinations retain torch;
+explicit backends take precedence. Auto execution stays mixed with CUDA linears;
+explicit torch permits automatic multi-GPU PD again. Server CLI accepts
+--linear-backend and --cuda-linear-tuning. Configuration tests: 17 passed;
+decode/linear GPU tests: seven passed including real eight-request generation
+without an explicit backend (112 adapters, four tokens each, graph replay).
+
+cfg22 counter follow-up: run_qwen_cuda.sh --cfg22-ncu supports isolated capture,
+resident/rotating28 timing, and in-model application replay; --cfg22-pytest
+checks FP16/BF16 diagnostic/graph parity, --cfg22-report renders the dated report.
+See benchmarks/_cfg22_ncu_20261117.md and results/cfg22_ncu_20261116/.
+38 isolated captures + two model positions distinguish DRAM-limited streaming
+from warm-cache grid/dependency/shared-bank limits. Diagnostic variant14 changes
+only cfg22 A swizzle and is not a production config. Removing conflicts did not
+improve rotating28 timing. Keep selectors unchanged; use timing_amortized.json,
+not the single-node pilot or NCU replay duration, for performance comparisons.
+Native .ncu-repz files open in a compatible Nsight Compute UI.
+
 Current cuda_decode full breakdown: --nsys --suite decode-current restores default
 scheduler/multi-step/mixed Graph flags with explicit resource caps, captures five
 fresh Windows-readable traces, and marks initialization/warmup separately.
@@ -25,8 +53,9 @@ kernel durations separately from CPU API wait and GPU idle intervals. Raw Window
 .nsys-rep/SQLite/JSON remain under profiles/; the dated report is
 benchmarks/_qwen_cuda_nsys_20261116.md. Existing directories are not overwritten.
 
-Qwen3 CUDA decoder projections are opt-in via Config.linear_backend
-(torch/cuda/cuda_auto/cuda_fp8/cuda_fp8_auto), installed before graph capture.
+Qwen3 CUDA decoder projections are selected via Config.linear_backend
+(torch/cuda/cuda_auto/cuda_fp8/cuda_fp8_auto/cuda_decode/cuda_decode_auto),
+installed before graph capture; the compatible Qwen3-0.6B default is cuda_decode.
 Only TP=1 mixed execution without existing weight quantization is supported.
 Runtime kernels are packaged under nanovllm/layers/csrc; the original standalone
 benchmark config IDs remain historical. GEMV/small-M tiles and FP8 per-row

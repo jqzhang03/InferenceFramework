@@ -45,3 +45,26 @@ def test_fp8_row_quantization_and_graph():
     expected = (packed.double() @ w.double().T) * scales.double()[:, None] * 0.02
     assert (out.double()-expected).norm()/expected.norm() < 0.004
     assert torch.count_nonzero(out[0]) == 0
+
+
+def test_qwen06_default_backend_generation():
+    from pathlib import Path
+
+    from nanovllm import LLM, SamplingParams
+
+    model = Path("/home/zjq/huggingface/Qwen3-0.6B")
+    if not model.is_dir():
+        pytest.skip("local Qwen3-0.6B checkpoint required")
+    llm = LLM(str(model), max_num_seqs=8, max_num_batched_tokens=256,
+              max_model_len=256, gpu_memory_utilization=0.55)
+    try:
+        assert llm.config.linear_backend == "cuda_decode"
+        assert llm.model_runner.cuda_linear_count == 112
+        outputs = llm.generate([[100, 200, 300, 400]] * 8,
+                               SamplingParams(temperature=0.8, max_tokens=4, ignore_eos=True),
+                               use_tqdm=False)
+        assert len(outputs) == 8
+        assert all(len(item["token_ids"]) == 4 for item in outputs)
+        assert llm.model_runner.decode_cudagraph_replay_count > 0
+    finally:
+        llm.exit()

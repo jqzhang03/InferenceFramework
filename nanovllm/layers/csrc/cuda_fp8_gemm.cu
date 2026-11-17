@@ -142,7 +142,10 @@ void validate_fp8(torch::Tensor a,torch::Tensor w,torch::Tensor out) {
  X(9,64,128,128,32,64,2) X(10,64,128,128,32,64,3) \
  X(11,128,128,128,32,64,2) X(12,128,256,64,64,64,2) X(13,128,256,64,64,64,3) \
  X(14,64,128,64,64,32,2) X(15,64,128,64,64,32,3) \
- X(16,32,64,64,16,32,3) X(17,64,64,128,32,32,3)
+ X(16,32,64,64,16,32,3) X(17,64,64,128,32,32,3) \
+ X(28,32,128,64,16,64,2) X(29,32,128,64,16,64,3) \
+ X(30,32,64,64,16,32,2) X(31,64,128,64,16,64,2) \
+ X(32,64,128,64,16,64,3) X(33,32,128,128,16,64,2)
 #define FP8_GROUPED_CONFIGS(X) \
  X(18,64,64,64,32,32,2) X(19,64,128,64,32,64,2) \
  X(20,128,128,64,32,64,2) X(21,64,128,128,32,64,2) X(22,128,128,128,32,64,2) \
@@ -174,7 +177,7 @@ template<bool E5> void dispatch_fp8(torch::Tensor a,torch::Tensor w,torch::Tenso
 }
 void gemm_fp8_out(torch::Tensor a,torch::Tensor w,torch::Tensor out,int64_t config,double alpha) {
     validate_fp8(a,w,out);
-    TORCH_CHECK(config>=0 && config<28,"config must be in [0,28)");
+    TORCH_CHECK(config>=0 && config<34,"config must be in [0,34)");
     TORCH_CHECK(std::isfinite(alpha) && std::abs(alpha)<=FLT_MAX,"invalid alpha");
     const c10::cuda::CUDAGuard guard(a.device());
     auto props=at::cuda::getDeviceProperties(a.get_device());
@@ -281,7 +284,7 @@ void pack_rows_out(torch::Tensor x,torch::Tensor out,torch::Tensor scales) {
 }
 void gemm_rows_out(torch::Tensor a,torch::Tensor w,torch::Tensor out,torch::Tensor scales,int config,double alpha) {
     validate_fp8(a,w,out);
-    TORCH_CHECK(a.scalar_type()==at::kFloat8_e4m3fn && config>=0 && config<28 && std::isfinite(alpha),"invalid row GEMM arguments");
+    TORCH_CHECK(a.scalar_type()==at::kFloat8_e4m3fn && config>=0 && config<34 && std::isfinite(alpha),"invalid row GEMM arguments");
     TORCH_CHECK(scales.device()==a.device() && scales.scalar_type()==at::kFloat && scales.numel()==a.size(0) && scales.is_contiguous(),"invalid scales");
     const c10::cuda::CUDAGuard guard(a.device());
     TORCH_CHECK(at::cuda::getDeviceProperties(a.get_device())->major==12,"SM120 required");

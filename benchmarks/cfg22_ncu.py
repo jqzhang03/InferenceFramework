@@ -163,12 +163,16 @@ def model_trace(args: argparse.Namespace) -> None:
 def model_capture(args: argparse.Namespace) -> None:
     from benchmarks.cuda_gemm_profile import select_ncu
     tool=select_ncu();folder=args.output/'model_context';folder.mkdir(exist_ok=True)
-    if any(folder.glob('*.ncu-rep*')):raise ValueError('preserve model context reports')
+    if any(folder.glob('*.ncu-rep*')) and not args.resume:raise ValueError('preserve model context reports; use --resume')
     metrics=['gpu__time_duration.sum','dram__bytes_op_read.sum','gpu__dram_throughput.avg.pct_of_peak_sustained_elapsed',
              'lts__t_sector_hit_rate.pct','sm__pipe_tensor_cycles_active.avg.pct_of_peak_sustained_elapsed',
              'sm__warps_active.avg.pct_of_peak_sustained_active','l1tex__data_bank_conflicts_pipe_lsu_mem_shared_op_ld.sum']
     for offset,name in ((28,'layer14_qkv'),(29,'layer14_gate_up')):
         prefix=folder/name
+        status_path=Path(str(prefix)+'.status.json')
+        if args.resume and status_path.exists() and json.loads(status_path.read_text())['returncode']==0 and Path(str(prefix)+'.csv').exists():
+            print('REUSE',name,flush=True)
+            continue
         command=[tool,'--target-processes','all','--profile-from-start','off','--kernel-name','regex:gemm_kernel',
                  '--launch-skip',str(offset),'--launch-count','1','--replay-mode','application',
                  '--clock-control','none','--cache-control','none','--metrics',','.join(metrics),'-o',str(prefix),

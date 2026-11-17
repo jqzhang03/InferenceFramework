@@ -1,0 +1,12 @@
+{
+  "device": "NVIDIA GeForce RTX 5060 Ti",
+  "backend": "cuda_decode",
+  "dtype": "fp16",
+  "selection_policy": "2026-11-17: seed17 screen; held-out42/99/123; rotating median >=3% gain; no >2% rotating or >5% resident regression",
+  "selectors": {
+    "8,4096,1024": {"mode": "decode", "config": 2},
+    "8,1024,2048": {"mode": "decode", "config": 7},
+    "8,6144,1024": {"mode": "decode", "config": 26},
+    "8,1024,3072": {"mode": "decode", "config": 7}
+  }
+}
