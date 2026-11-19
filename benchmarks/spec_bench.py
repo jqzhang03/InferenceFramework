@@ -132,6 +132,7 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
               medusa_path=args.medusa_path if speculative == "medusa" else "",
               eagle_path=(args.eagle3_path if speculative == "eagle3" else
                           args.eagle_path if speculative in ("eagle", "eagle2") else ""),
+              dflash_path=args.dflash_path if speculative == "dflash" else "",
               max_draft_len=args.max_draft_len,
               eagle_tree_top_k=args.eagle_tree_top_k,
               eagle_tree_max_nodes=args.eagle_tree_max_nodes,
@@ -168,34 +169,38 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
             from nanovllm.engine.eagle_tree import verify_tree
             from nanovllm.engine.ngram import verify_drafts
 
-            original_run = llm.model_runner.run
+            def record_logits(original_run, eos):
+                def diagnostic_run(seqs, kind, return_logits=False, return_hidden=False):
+                    result = original_run(seqs, kind, True, return_hidden)
+                    tokens, logits = result[:2]
+                    scores, ids = logits.topk(2, dim=-1)
+                    scores, ids = scores.tolist(), ids.tolist()
+                    offset = 0
+                    for seq in seqs:
+                        drafts = seq.draft_tokens
+                        count = 1 if drafts is None else len(drafts) + 1
+                        if drafts is None:
+                            partial_prefill = (
+                                seq.is_prefill and seq.num_cached_tokens + seq.num_scheduled_tokens < len(seq)
+                            )
+                            path = [] if partial_prefill else [0]
+                        elif seq.draft_parents is None:
+                            _, accepted = verify_drafts(drafts, tokens[offset:offset + count])
+                            path = list(range(accepted))
+                        else:
+                            _, path = verify_tree(drafts, seq.draft_parents, tokens[offset:offset + count],
+                                                  None if seq.ignore_eos else eos)
+                        rows = logit_trace.setdefault(seq.seq_id, [])
+                        rows.extend(dict(top2=ids[offset + i], logits=scores[offset + i],
+                                         margin=scores[offset + i][0] - scores[offset + i][1]) for i in path)
+                        offset += count
+                    if return_logits:
+                        return result
+                    return (tokens, result[2]) if return_hidden else tokens
 
-            def diagnostic_run(seqs, kind, return_logits=False, return_hidden=False):
-                result = original_run(seqs, kind, True, return_hidden)
-                tokens, logits = result[:2]
-                scores, ids = logits.topk(2, dim=-1)
-                scores, ids = scores.tolist(), ids.tolist()
-                offset = 0
-                for seq in seqs:
-                    drafts = seq.draft_tokens
-                    count = 1 if drafts is None else len(drafts) + 1
-                    if drafts is None:
-                        path = [] if seq.is_prefill and seq.num_cached_tokens + seq.num_scheduled_tokens < len(seq) else [0]
-                    elif seq.draft_parents is None:
-                        _, accepted = verify_drafts(drafts, tokens[offset:offset + count])
-                        path = list(range(accepted))
-                    else:
-                        _, path = verify_tree(drafts, seq.draft_parents, tokens[offset:offset + count],
-                                              None if seq.ignore_eos else llm.config.eos)
-                    rows = logit_trace.setdefault(seq.seq_id, [])
-                    rows.extend(dict(top2=ids[offset + i], logits=scores[offset + i],
-                                     margin=scores[offset + i][0] - scores[offset + i][1]) for i in path)
-                    offset += count
-                if return_logits:
-                    return result
-                return (tokens, result[2]) if return_hidden else tokens
+                return diagnostic_run
 
-            llm.model_runner.run = diagnostic_run
+            llm.model_runner.run = record_logits(llm.model_runner.run, llm.config.eos)
         if args.phase_timing:
             def measure(owner, method, name):
                 original = getattr(owner, method)
@@ -213,7 +218,10 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
                 setattr(owner, method, measured)
 
             measure(llm.model_runner, "run_model", lambda inputs: f"target_{inputs[2]}")
-            measure(llm, "_eagle3_drafts" if speculative == "eagle3" else "_eagle_drafts", "draft")
+            draft_method = {"eagle": "_eagle_drafts", "eagle2": "_eagle_drafts",
+                            "eagle3": "_eagle3_drafts", "dflash": "_dflash_drafts"}.get(speculative)
+            if draft_method:
+                measure(llm, draft_method, "draft")
         started = time.perf_counter()
         outputs = llm.generate(prompts_tok, sampling_params, use_tqdm=False)
         torch.cuda.synchronize()
@@ -401,10 +409,11 @@ def main() -> None:
     parser.add_argument("--chat-template", action="store_true",
                         help="wrap prompt-file user text with the tokenizer chat template")
     parser.add_argument("--speculative", default="none,ngram",
-                        help="comma-separated modes: none,ngram,medusa,eagle,eagle2,eagle3")
+                        help="comma-separated modes: none,ngram,medusa,eagle,eagle2,eagle3,dflash")
     parser.add_argument("--medusa-path", default="results/medusa_heads.pt")
     parser.add_argument("--eagle-path", default="results/eagle_layer.pt")
     parser.add_argument("--eagle3-path", default="results/eagle3_qwen3_0.6b")
+    parser.add_argument("--dflash-path", default="results/dflash_qwen3_0.6b/verified")
     parser.add_argument("--eagle-tree-top-k", type=int, default=2)
     parser.add_argument("--eagle-tree-max-nodes", type=int, default=8)
     parser.add_argument("--enforce-eager", action="store_true")
@@ -453,7 +462,7 @@ def main() -> None:
     spec_modes = [item.strip() for item in args.speculative.split(",") if item.strip()]
     if not spec_modes or "none" not in spec_modes:
         raise ValueError("--speculative must include the none baseline")
-    if any(mode not in {"none", "ngram", "medusa", "eagle", "eagle2", "eagle3"} for mode in spec_modes):
+    if any(mode not in {"none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash"} for mode in spec_modes):
         raise ValueError("unsupported speculative mode")
     if "medusa" in spec_modes and not os.path.isfile(args.medusa_path):
         raise FileNotFoundError(f"Medusa weights do not exist: {args.medusa_path}")
@@ -464,7 +473,12 @@ def main() -> None:
         for filename in ("config.json", "model.safetensors"):
             if not (Path(args.eagle3_path) / filename).is_file():
                 raise FileNotFoundError(Path(args.eagle3_path) / filename)
-    if {"eagle2", "eagle3"}.intersection(spec_modes):
+    if "dflash" in spec_modes:
+        args.dflash_path = os.path.expanduser(args.dflash_path)
+        for filename in ("config.json", "model.safetensors"):
+            if not (Path(args.dflash_path) / filename).is_file():
+                raise FileNotFoundError(Path(args.dflash_path) / filename)
+    if {"eagle2", "eagle3", "dflash"}.intersection(spec_modes):
         args.enforce_eager = True
     if args.chat_template and not args.prompts_file:
         raise ValueError("--chat-template requires --prompts-file")
@@ -529,6 +543,8 @@ def main() -> None:
         "eagle_tree_max_nodes": args.eagle_tree_max_nodes,
         "eagle3_path": args.eagle3_path if "eagle3" in spec_modes else None,
     }
+    if "dflash" in spec_modes:
+        expected_config["dflash_path"] = args.dflash_path
     completed_pair_keys = set()
     if args.resume:
         if not output_path.is_file():

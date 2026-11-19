@@ -121,7 +121,7 @@ outputs[0]["text"]
 
 Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
 `nvfp4_backend="software|cublaslt"`,
-`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3"`, `rolling_cache=True`,
+`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3|dflash"`, `rolling_cache=True`,
 `kv_swap=True` (default), and `execution_mode="auto|mixed|pd"`. `example.py` is an end-to-end demo; `benchmarks/bench.py` produces
 the full TTFT/TPOT/E2E/p50/p99/SLO report and a JSON artifact under `results/`.
 
@@ -132,6 +132,19 @@ and `model.safetensors` from the supported Qwen3-0.6B draft checkpoint. Its draf
 KV is initialized during prefill, so it uses private target prefix blocks and
 recomputes preempted requests. Set `max_draft_len`, `eagle_tree_top_k`, and
 `eagle_tree_max_nodes` to control tree depth, frontier width, and draft node budget.
+The paired EAGLE benchmark and reproduction commands are in the
+[Qwen3-0.6B EAGLE comparison](benchmarks/_eagle_comparison_20261119.md).
+
+Set `speculative="dflash"` and `dflash_path="/path/to/draft"` for Qwen3-0.6B
+on a single GPU with BF16 and ordinary paged KV. The local directory contains
+`config.json` and `model.safetensors` for a matching full-attention DFlash
+Speculators draft. The draft uses one bidirectional forward per batch and the
+target verifies its proposals with the existing causal speculative path.
+`max_draft_len` bounds the proposed tokens. This path uses eager execution,
+private prefix pages, and recompute on preemption.
+[Supported public draft weights](https://huggingface.co/arnabwithab/Qwen3-0.6B-DFlash-noshift-b8/commit/b4a61819293fdb9106e648b0422c38dbf90bb3f4).
+The [DFlash comparison](benchmarks/_dflash_comparison_20261119.md) includes
+the paired benchmark and reproduction commands.
 
 For pure INT4 MoE experts, `moe_int4_backend="loop|segment"` selects the per-expert or
 segmented GEMM path; `moe_int4_fuse_gate_up` controls gate/up launch fusion on the segmented

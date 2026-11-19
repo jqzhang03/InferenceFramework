@@ -202,17 +202,19 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        *, capture_eagle3: bool = False,
+        *, capture_eagle3: bool = False, capture_layers: tuple[int, ...] = (),
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
+        if capture_eagle3:
+            capture_layers = (2, 14, 25)
         features = []
         for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
-            if capture_eagle3 and i in (1, 13, 24):
+            if i + 1 in capture_layers:
                 features.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        if capture_eagle3:
+        if capture_layers:
             return hidden_states, torch.cat(features, dim=-1)
         return hidden_states
 

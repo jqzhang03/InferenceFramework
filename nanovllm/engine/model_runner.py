@@ -99,6 +99,10 @@ class ModelRunner:
         if config.speculative == "eagle3":
             from nanovllm.layers.eagle3 import Eagle3Layer
             self.eagle_layer = Eagle3Layer.load(config.eagle_path).to(device="cuda", dtype=hf_config.dtype)
+        if config.speculative == "dflash":
+            from nanovllm.layers.dflash import DFlashDraft
+            self.dflash = DFlashDraft.load(config.dflash_path, config.max_model_len,
+                                           config.max_draft_len).to(device="cuda", dtype=hf_config.dtype)
         # W8A8权重量化（SmoothQuant式：校准激活通道分布→折叠进权重→per-channel int8 + Triton int8 GEMM）
         # 放在sampler之后：校准用的run()会调用sampler。streaming 模式的量化已由
         # chunk_hook 在加载期完成，这里跳过。
@@ -879,8 +883,21 @@ class ModelRunner:
         block_bytes = 2 * num_layers * self.block_size * num_kv_heads * head_dim * itemsize
         # 根据可用显存计算可分配的KV Cache块总数
         # 总显存x利用率-已使用显存-预热峰值+当前已分配了的显存 除以 单块大小
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        budget = int(total * config.gpu_memory_utilization - used - peak + current)
+        if config.speculative == "dflash":
+            draft_bytes = self.dflash.page_bytes(self.block_size, itemsize)
+            # One tail scratch page per active drafter, at most one per live context page.
+            both = block_bytes + draft_bytes
+            scratch = min(config.max_num_seqs, budget // (both + draft_bytes))
+            config.num_kvcache_blocks = (
+                scratch if scratch < config.max_num_seqs
+                else (budget - scratch * draft_bytes) // both
+            )
+        else:
+            config.num_kvcache_blocks = budget // block_bytes
         assert config.num_kvcache_blocks > 0
+        if config.speculative == "dflash":
+            self.dflash_cache = self.dflash.allocate_cache(config.num_kvcache_blocks, scratch, self.block_size)
         kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
         self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks,
                                     self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
@@ -1389,6 +1406,10 @@ class ModelRunner:
                   return_hidden: bool = False):
         if return_hidden and self.config.speculative == "eagle3":
             hidden, features = self.model.model(input_ids, positions, capture_eagle3=True)
+            return self.model.compute_logits(hidden), features
+        if return_hidden and self.config.speculative == "dflash":
+            hidden, features = self.model.model(input_ids, positions,
+                                                capture_layers=self.dflash.target_layers)
             return self.model.compute_logits(hidden), features
         # 纯spec批次（verify）走spec CUDA graph：固定容量+零长度行填充，消除eager的
         # 逐kernel启动税（实测~10ms/步，见INTERVIEW.md §10.3.5）。按本步最大query长度

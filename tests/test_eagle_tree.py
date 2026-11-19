@@ -1,3 +1,4 @@
+import gc
 from types import SimpleNamespace
 
 import pytest
@@ -224,6 +225,9 @@ def test_eagle3_chunked_prefill_and_mixed_verification():
     draft = Path("results/eagle3_qwen3_0.6b")
     if not ((target / "config.json").is_file() and (draft / "model.safetensors").is_file()):
         pytest.skip("local target and draft weights required")
+    # KV sizing uses device-wide free memory, including earlier tests' reservations.
+    gc.collect()
+    torch.cuda.empty_cache()
     llm = LLM(str(target), speculative="eagle3", eagle_path=str(draft),
               max_model_len=512, max_num_batched_tokens=256, max_num_seqs=4,
               gpu_memory_utilization=.5, latency_aware_scheduling=False,

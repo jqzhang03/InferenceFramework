@@ -70,6 +70,7 @@ class Config:
     max_draft_len: int = 4 # 每步最大草稿数γ（vLLM --num-speculative-tokens 常用值）
     medusa_path: str = "" # Medusa头权重文件（.pt，benchmarks/medusa_train.py训练产出）；speculative="medusa"时必须
     eagle_path: str = "" # local .pt for EAGLE-1/2, checkpoint directory for EAGLE-3
+    dflash_path: str = "" # local Qwen3-0.6B DFlash Speculators checkpoint directory
     eagle_tree_top_k: int = 2
     eagle_tree_max_nodes: int = 8 # candidate nodes, excluding the already emitted root token
     medusa_hidden: int = 256 # Medusa头隐藏维（输出层256×vocab是主要参数，控制总规模）
@@ -144,7 +145,7 @@ class Config:
                 "当前 PD 分离版本暂不支持 rolling_cache"
             assert self.kv_cache_dtype == "auto", \
                 "当前 PD KV 传输暂要求 kv_cache_dtype='auto'"
-        assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3"), \
+        assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash"), \
             f"unknown speculative: {self.speculative}"
         assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "awq", "sparse24", "fp8"), \
             f"unknown quantization: {self.quantization}"
@@ -163,20 +164,33 @@ class Config:
             assert self.medusa_path, "speculative=medusa requires medusa_path"
         if self.speculative in ("eagle", "eagle2", "eagle3"):
             assert self.eagle_path, f"speculative={self.speculative} requires eagle_path"
+        if self.speculative == "dflash":
+            assert self.dflash_path, "speculative=dflash requires dflash_path"
+            self.dflash_path = os.path.expanduser(self.dflash_path)
+            for filename in ("config.json", "model.safetensors"):
+                path = os.path.join(self.dflash_path, filename)
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(path)
+            self.dflash_path = os.path.expanduser(self.dflash_path)
+            for filename in ("config.json", "model.safetensors"):
+                path = os.path.join(self.dflash_path, filename)
+                if not os.path.isfile(path):
+                    raise FileNotFoundError(path)
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        if self.speculative in ("eagle2", "eagle3"):
+        if self.speculative in ("eagle2", "eagle3", "dflash"):
             hf = self.hf_config
             shape = tuple(getattr(hf, key, None) for key in (
                 "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
                 "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size"))
             assert shape == ("qwen3", 1024, 28, 3072, 16, 8, 128, 151936), \
-                "EAGLE-2/3 currently require Qwen3-0.6B"
+                f"{self.speculative} currently requires Qwen3-0.6B"
             assert str(hf.dtype) in ("torch.bfloat16", "bfloat16") and self.tensor_parallel_size == 1 \
                 and self.quantization == "none" and self.kv_cache_dtype == "auto" and not self.rolling_cache, \
-                "EAGLE-2/3 require single-GPU BF16 with unquantized paged KV and weights"
+                f"{self.speculative} requires single-GPU BF16 with unquantized paged KV and weights"
+            self.enforce_eager = True
+        if self.speculative in ("eagle2", "eagle3"):
             assert 1 <= self.eagle_tree_top_k <= 8 and 1 <= self.max_draft_len <= 8 \
                 and 1 <= self.eagle_tree_max_nodes <= 32, "invalid EAGLE tree budget"
-            self.enforce_eager = True
         if self.int4_kernel_backend is None:
             self.int4_kernel_backend = self._default_int4_kernel_backend()
         if self.int4_kernel_backend == "cuda":

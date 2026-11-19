@@ -518,6 +518,65 @@ class LLMEngine:
                 layer.logits(h[:, -1]), advance, layer.target_ids, self.config.eagle_tree_top_k,
                 depth, budget, self.config.eos)
 
+    @torch.inference_mode()
+    def _dflash_drafts(self, spans: list[tuple[Sequence, int, int, bool, bool]],
+                       features: torch.Tensor, paths: dict[int, list[int]]) -> None:
+        runner = self.model_runner
+        draft, cache = runner.dflash, runner.dflash_cache
+        offset = 0
+        positions, slots, selected_rows = [], [], []
+        active, anchors, lengths, tables = [], [], [], []
+        for seq, start, count, prefill, partial_prefill in spans:
+            row_start = offset
+            offset += count
+            if seq.is_finished:
+                continue
+            # A linear verification row is committed only when its prediction
+            # is used. The newly emitted anchor has no target hidden state yet.
+            committed = count if prefill else len(paths[seq.seq_id])
+            end = start + committed
+            positions.extend(range(start, end))
+            slots.extend(runner._span_slots(seq.block_table, start, end))
+            selected_rows.extend(range(row_start, row_start + committed))
+            if partial_prefill:
+                continue
+            depth = min(self.config.max_draft_len, self.config.max_model_len - len(seq),
+                        seq.max_tokens - seq.num_completion_tokens - 1)
+            seq.draft_tokens = []
+            if depth <= 0:
+                continue
+            # The tail block may land in the context's last private page.
+            # Any extra page is scratch, indexed by batch row, never committed.
+            page_count = (end + cache.page_size - 1) // cache.page_size
+            table = seq.block_table[:page_count]
+            if end + draft.block_size > page_count * cache.page_size:
+                table.append(cache.num_context_blocks + len(active))
+            tables.append(table)
+            lengths.append(end)
+            anchors.append(seq.last_token)
+            active.append((seq, depth))
+
+        if positions:
+            metadata = torch.tensor([positions, slots, selected_rows],
+                                    dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+            context = features
+            if len(selected_rows) != features.size(0):
+                context = features.index_select(0, metadata[2])
+            draft.store_context(context, metadata[0], metadata[1], cache)
+        if active:
+            width = max(map(len, tables))
+            block_table = torch.tensor([row + [-1] * (width - len(row)) for row in tables],
+                                       dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+            ids = torch.tensor([anchors, lengths], dtype=torch.int32,
+                               pin_memory=True).cuda(non_blocking=True)
+            proposals = draft(ids[0], ids[1], block_table, cache,
+                              max(depth for _, depth in active)).tolist()
+            for (seq, depth), row in zip(active, proposals):
+                row = row[:depth]
+                if self.config.eos in row:
+                    row = row[:row.index(self.config.eos)]
+                seq.draft_tokens = row
+
     def _pd_transfer_sequence(self, seq: Sequence) -> None:
         """Move a completed prefill sequence and its prompt KV into the decode pool."""
         cached_tokens = seq.num_cached_tokens
@@ -774,16 +833,16 @@ class LLMEngine:
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
         # Medusa/EAGLE模式：spec步需要最后一层hidden（下轮草稿输入）
         mode = self.config.speculative
-        return_hidden = (mode == "eagle3" or mode in ("eagle", "eagle2") and has_spec
+        return_hidden = (mode in ("eagle3", "dflash") or mode in ("eagle", "eagle2") and has_spec
                          or mode == "medusa" and kind == "spec")
-        eagle3_spans = []
-        if mode == "eagle3":
+        draft_spans = []
+        if mode in ("eagle3", "dflash"):
             for seq in seqs:
                 start = seq.num_cached_tokens if seq.is_prefill else len(seq) - 1
                 count = seq.num_scheduled_tokens
-                eagle3_spans.append((seq, start, count, seq.is_prefill,
-                                     seq.is_prefill and start + count < len(seq)))
-        paths = {} if mode == "eagle3" else None
+                draft_spans.append((seq, start, count, seq.is_prefill,
+                                    seq.is_prefill and start + count < len(seq)))
+        paths = {} if mode in ("eagle3", "dflash") else None
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
@@ -851,7 +910,9 @@ class LLMEngine:
         # Medusa/EAGLE：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
         if return_hidden:
             if mode == "eagle3":
-                self._eagle3_drafts(eagle3_spans, hidden, paths)
+                self._eagle3_drafts(draft_spans, hidden, paths)
+            elif mode == "dflash":
+                self._dflash_drafts(draft_spans, hidden, paths)
             elif mode in ("eagle", "eagle2"):
                 self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list, scheduled_prefill_tokens)
             else:
