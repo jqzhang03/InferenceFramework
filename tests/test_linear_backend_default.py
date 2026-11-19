@@ -56,3 +56,35 @@ def test_explicit_unsupported_backend_still_rejected(tmp_path, monkeypatch):
         make_config(tmp_path, monkeypatch, linear_backend="cuda_decode", quantization="int4")
     with pytest.raises(AssertionError, match="requires a frozen"):
         make_config(tmp_path, monkeypatch, linear_backend="cuda_decode_auto")
+
+
+@pytest.mark.parametrize("overrides,expected", [
+    ({}, "cuda"),
+    ({"int4_kernel_backend": None}, "cuda"),
+    ({"int4_kernel_backend": "triton"}, "triton"),
+    ({"quantization": "none"}, "triton"),
+    ({"moe_int4_backend": "segment"}, "triton"),
+    ({"int4_group_size": 32}, "triton"),
+    ({"tensor_parallel_size": 2}, "triton"),
+    ({"execution_mode": "pd"}, "triton"),
+])
+def test_deepseek_lite_int4_default(tmp_path, monkeypatch, overrides, expected):
+    fields = dict(model_type="deepseek_v2", hidden_size=2048, intermediate_size=10944,
+                  moe_intermediate_size=1408, num_hidden_layers=27, n_routed_experts=64)
+    options = dict(quantization="int4", int4_group_size=64)
+    options.update(overrides)
+    config = make_config(tmp_path, monkeypatch, hf_changes=fields, **options)
+    assert config.int4_kernel_backend == expected
+    assert config.linear_backend == "torch"
+
+
+@pytest.mark.parametrize("changes", [
+    {"model_type": "qwen3"}, {"num_hidden_layers": 60}, {"dtype": "float32"},
+])
+def test_other_models_and_dtypes_keep_triton_int4(tmp_path, monkeypatch, changes):
+    fields = dict(model_type="deepseek_v2", hidden_size=2048, intermediate_size=10944,
+                  moe_intermediate_size=1408, num_hidden_layers=27, n_routed_experts=64)
+    fields.update(changes)
+    config = make_config(tmp_path, monkeypatch, hf_changes=fields,
+                         quantization="int4", int4_group_size=64)
+    assert config.int4_kernel_backend == "triton"

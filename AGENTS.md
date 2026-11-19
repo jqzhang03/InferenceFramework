@@ -1,5 +1,38 @@
 # Repository Guidelines
 
+### Warp-owned M1-4 GEMV (2026-11-17 follow-up)
+
+`run_qwen_cuda.sh --warp-gemv-study --output <fresh-dir>` compares Decode38–49
+against frozen runtime, ordinary GEMV and shared SIMT. Each 128-thread CTA uses
+8/16/32-lane groups, 1/2 outputs and 1/2 accumulation chains; M1-4 are specialized.
+The kernel uses register reuse and shuffle, no shared allocation, CTA barrier or
+Split-K buffer. Keep all lanes participating in shuffles on boundary outputs.
+Held-out42/99/123 accepted 6 BF16 shapes (M2 QKV/gate-up, all M3 projections) and
+12 FP16 shapes (all M2-4 projections) on RTX5060Ti, now in bundled cuda_decode
+selectors. M1, BF16 M4, M8+ and unmatched shapes retain prior choices. Explicit
+tuning still overrides. Preserve profiles/cuda_warp_gemv_20261117/; use independent
+graph timings, not NCU replay durations. --warp-gemv-pytest passed 29 tests (24 GPU,
+5 profiling parser), including GPU boundary,
+stream, graph, selector and existing model checks plus profiling attribution.
+See benchmarks/_cuda_warp_gemv_20261117.md. Earlier BF16-unchanged notes describe
+the prior tile/pipeline study, before this follow-up.
+
+### CUDA pipeline tuning follow-up (2026-11-17)
+
+`run_qwen_cuda.sh --pipeline-study --output <fresh-dir>` screens native CUDA
+tile/warp/stage configurations, validates on held-out seeds, and collects NCU
+controls. `--pipeline-pytest` passed 15 GPU tests, including actual selector
+installation, changed-input graph replay and default BF16 model generation.
+New candidate IDs: Decode 24–37, GEMM 24–35, FP8 28–33; historical IDs remain.
+RTX 5060 Ti frozen selectors now cover FP16 cuda_decode B8 projections and
+BF16-activation cuda_fp8 M128 QKV; explicit tuning wins, unmatched shapes retain
+legacy dispatch. The default BF16 cuda_decode selector is unchanged. Preserve
+Split-K finish/FP8 pack and all 87 native NCU reports under
+profiles/cuda_pipeline_20261117/. More work per thread, deeper stages and fewer
+shared conflicts did not consistently improve latency; use independent paired
+graph timings, not replay durations. DeepSeek float probes are not deployed INT4.
+See benchmarks/_cuda_pipeline_20261117.md for gates, counters and limitations.
+
 ### Custom-only CUDA profiling (2026-11-17)
 
 `run_qwen_cuda.sh --operator-profile --output <fresh-dir>` runs independent

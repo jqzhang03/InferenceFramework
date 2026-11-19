@@ -293,7 +293,8 @@ class LLMEngine:
         callback = self._decode_burst_yield_callback
         return bool(callback is not None and callback())
 
-    def _verify(self, seqs: list[Sequence], token_ids: list[int]):
+    def _verify(self, seqs: list[Sequence], token_ids: list[int],
+                paths: dict[int, list[int]] | None = None):
         """投机验收：把逐行样本与草稿比对，返回每序列已接受token列表。
 
         logits行序 = 批次行序：普通行每seq 1行（LM head已归约）；verify行每seq
@@ -312,6 +313,7 @@ class LLMEngine:
         idx = 0
         n_decode = n_draft = n_draft_acc = n_verify = 0
         n_acc_list = []
+        moves = []
         for seq in seqs:
             if seq.draft_tokens is None:
                 token_lists.append([token_ids[idx]])
@@ -323,7 +325,17 @@ class LLMEngine:
             n = len(drafts) + 1
             samples = token_ids[idx:idx + n]
             idx += n
-            accepted, n_acc = verify_drafts(drafts, samples)
+            if seq.draft_parents is not None:
+                from nanovllm.engine.eagle_tree import verify_tree
+                accepted, path = verify_tree(drafts, seq.draft_parents, samples,
+                                             None if seq.ignore_eos else self.config.eos)
+                n_acc = len(accepted)
+                moves.append((seq, path))
+            else:
+                accepted, n_acc = verify_drafts(drafts, samples)
+                path = list(range(n_acc))
+            if paths is not None:
+                paths[seq.seq_id] = path
             seq.spec_proposed_tokens += len(drafts)
             seq.spec_accepted_tokens += max(0, n_acc - 1)
             seq.spec_verify_steps += 1
@@ -334,6 +346,8 @@ class LLMEngine:
             n_draft_acc += n_acc - 1
             n_verify += n
             n_acc_list.append(n_acc)
+        if moves:
+            self.model_runner.call("compact_tree_kv", moves)
         return token_lists, n_decode, n_draft, n_draft_acc, n_verify, n_acc_list
 
     def _medusa_drafts(self, seqs: list[Sequence], hidden: torch.Tensor,
@@ -381,37 +395,56 @@ class LLMEngine:
                     drafts.append(t)
                 seq.draft_tokens = drafts
 
+    @torch.inference_mode()
     def _eagle_drafts(self, seqs: list[Sequence], hidden: torch.Tensor,
-                      n_acc_list: list[int], n_rows_list: list[int]):
+                      n_acc_list: list[int], n_rows_list: list[int], prefill_tokens: int = 0):
         """EAGLE-1 草稿：从验收后新 t_last 的 hidden 自回归生成 γ 个草稿 token。
 
         F(h_t, e(w_{t+1})) → h̃_{t+1} → LM_head → argmax 采样 w_{t+2}；下一步
         F(h̃_{t+1}, e(w_{t+2}))…（hidden 与 token 双自回归，草稿分布条件化于已草拟
         内容——比 Medusa 的并行头更接近目标分布，α 更高）。
 
-        hidden 行选择与 _medusa_drafts 同语义：非全接受用第 n_acc 行（t_last 的
-        feature），全接受（bonus 无 hidden）用第 γ_i 行；起始 token = seq.last_token
-        （postprocess_spec 已追加）。EOS 截断与 n-gram 一致。
+        n_acc contains the final target sample. Row n_acc-1 holds the hidden
+        state preceding that token, whether the sample replaced a draft or was a bonus.
         按步跨 seq 批量（每步一个 [m, H] 前向 + LM head），γ 步串行。
         """
         layer = self.model_runner.eagle_layer
         gamma = self.config.max_draft_len
         eos = self.config.eos
         # mixed步里prefill行在hidden前面，spec组从n_prefill_tokens起
-        h_offset = sum(seq.num_scheduled_tokens for seq in seqs if seq.is_prefill)
-        row = h_offset
+        row = prefill_tokens
         items = []  # (seq, hidden行)
         for seq, n_acc, n_rows in zip(seqs, n_acc_list, n_rows_list):
             if n_acc == 0:
                 continue  # 非verify行（prefill行）
-            gamma_i = n_rows - 1
-            idx = row + (n_acc if n_acc <= gamma_i else gamma_i)
-            items.append((seq, idx))
+            if not seq.is_finished:
+                items.append((seq, row + n_acc - 1))
             row += n_rows
         if not items:
             return
         embed = self.model_runner.model.model.embed_tokens
         lm_head = self.model_runner.model.lm_head
+        if self.config.speculative == "eagle2":
+            from nanovllm.engine.eagle_tree import build_tree
+            for seq, idx in items:
+                depth, budget = self._eagle_tree_budget(seq)
+                if not budget:
+                    seq.draft_tokens, seq.draft_parents = [], []
+                    continue
+                root_token = torch.tensor([seq.last_token], device=hidden.device)
+                h = layer(hidden[idx:idx + 1], embed(root_token))
+                states = {0: h[0]}
+
+                def advance(nodes: list[int], parents: list[int], tokens: list[int]) -> torch.Tensor:
+                    h_next = layer(torch.stack([states[i] for i in parents]),
+                                   embed(torch.tensor(tokens, device=hidden.device)))
+                    states.update(zip(nodes, h_next.unbind()))
+                    return F.linear(h_next, lm_head.weight)
+
+                seq.draft_tokens, seq.draft_parents = build_tree(
+                    F.linear(h, lm_head.weight), advance, None, self.config.eagle_tree_top_k,
+                    depth, budget, eos)
+            return
         h = torch.stack([hidden[i] for _, i in items])            # [m, H]
         w = torch.tensor([s.last_token for s, _ in items], device=h.device)
         active_seqs = [s for s, _ in items]
@@ -439,6 +472,51 @@ class LLMEngine:
             active_seqs = [active_seqs[j] for j in keep_idx]
         for s, _ in items:
             s.draft_tokens = drafts[id(s)]
+
+    def _eagle_tree_budget(self, seq: Sequence) -> tuple[int, int]:
+        capacity = max(0, self.config.max_model_len - len(seq))
+        remaining = max(0, seq.max_tokens - seq.num_completion_tokens - 1)
+        return (min(self.config.max_draft_len, capacity, remaining),
+                min(self.config.eagle_tree_max_nodes, capacity) if remaining else 0)
+
+    @torch.inference_mode()
+    def _eagle3_drafts(self, spans: list[tuple[Sequence, int, int, bool, bool]],
+                       features: torch.Tensor, paths: dict[int, list[int]]) -> None:
+        from nanovllm.engine.eagle_tree import build_tree
+
+        layer = self.model_runner.eagle_layer
+        embed = self.model_runner.model.model.embed_tokens
+        offset = 0
+        for seq, start, count, prefill, partial_prefill in spans:
+            rows = features[offset:offset + count]
+            offset += count
+            if seq.is_finished:
+                seq.eagle3_kv = None
+                continue
+            if not prefill:
+                rows = rows[paths[seq.seq_id]]
+            if not start:
+                seq.eagle3_kv = None
+            if start and (seq.eagle3_kv is None or seq.eagle3_kv[0].size(2) != start):
+                raise RuntimeError("EAGLE-3 draft KV lost alignment with the committed prefix")
+            tokens = torch.tensor(seq[start + 1:start + 1 + len(rows)], device=features.device)
+            h, seq.eagle3_kv = layer(rows.unsqueeze(0), embed(tokens).unsqueeze(0), seq.eagle3_kv)
+            if partial_prefill:
+                continue
+            depth, budget = self._eagle_tree_budget(seq)
+            states = {0: (h[:, -1:], seq.eagle3_kv)}
+
+            def advance(nodes: list[int], parents: list[int], tokens: list[int]) -> torch.Tensor:
+                previous = torch.cat([states[i][0] for i in parents], dim=0)
+                past = tuple(torch.cat([states[i][1][j] for i in parents], dim=0) for j in range(2))
+                out, kv = layer(previous, embed(torch.tensor(tokens, device=features.device))[:, None], past)
+                for index, node in enumerate(nodes):
+                    states[node] = (out[index:index + 1], tuple(k[index:index + 1] for k in kv))
+                return layer.logits(out[:, -1])
+
+            seq.draft_tokens, seq.draft_parents = build_tree(
+                layer.logits(h[:, -1]), advance, layer.target_ids, self.config.eagle_tree_top_k,
+                depth, budget, self.config.eos)
 
     def _pd_transfer_sequence(self, seq: Sequence) -> None:
         """Move a completed prefill sequence and its prompt KV into the decode pool."""
@@ -695,7 +773,17 @@ class LLMEngine:
         # 本步是否含verify行（投机）：任一行带draft_tokens（[]也算，表示γ=0的verify行）
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
         # Medusa/EAGLE模式：spec步需要最后一层hidden（下轮草稿输入）
-        return_hidden = self.config.speculative in ("medusa", "eagle") and kind == "spec"
+        mode = self.config.speculative
+        return_hidden = (mode == "eagle3" or mode in ("eagle", "eagle2") and has_spec
+                         or mode == "medusa" and kind == "spec")
+        eagle3_spans = []
+        if mode == "eagle3":
+            for seq in seqs:
+                start = seq.num_cached_tokens if seq.is_prefill else len(seq) - 1
+                count = seq.num_scheduled_tokens
+                eagle3_spans.append((seq, start, count, seq.is_prefill,
+                                     seq.is_prefill and start + count < len(seq)))
+        paths = {} if mode == "eagle3" else None
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
@@ -750,7 +838,7 @@ class LLMEngine:
             n_rows_list = [seq.num_scheduled_tokens if seq.draft_tokens is not None else 0
                            for seq in seqs]
             (token_lists, n_decode, n_draft, n_draft_acc, n_verify,
-             n_acc_list) = self._verify(seqs, token_ids)
+             n_acc_list) = self._verify(seqs, token_ids, paths)
             self.scheduler.postprocess_spec(seqs, token_lists)
             # 投机统计（与kind无关，混合步同样累计）
             self._step_stats["spec_steps"] += 1
@@ -762,8 +850,10 @@ class LLMEngine:
             self.scheduler.postprocess(seqs, token_ids)
         # Medusa/EAGLE：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
         if return_hidden:
-            if self.config.speculative == "eagle":
-                self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list)
+            if mode == "eagle3":
+                self._eagle3_drafts(eagle3_spans, hidden, paths)
+            elif mode in ("eagle", "eagle2"):
+                self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list, scheduled_prefill_tokens)
             else:
                 self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
         self._record_step_tokens(seqs, before)

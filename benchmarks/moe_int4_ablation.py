@@ -339,6 +339,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_memory_utilization,
         quantization="int4",
         int4_group_size=args.int4_group_size,
+        int4_kernel_backend="triton",
         int4_dense_path=False,
         streaming_load=True,
         kv_swap=False,

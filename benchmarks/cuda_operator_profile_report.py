@@ -12,7 +12,7 @@ import sqlite3
 import statistics
 
 
-CUSTOM_NAMES = ("gemm_kernel", "linear_gemv_kernel", "decode_mma_kernel", "decode_simt_kernel",
+CUSTOM_NAMES = ("gemm_kernel", "linear_gemv_kernel", "decode_mma_kernel", "decode_simt_kernel", "decode_warp_gemv_kernel",
                 "finish_kernel", "fp8_kernel", "pack_rows_kernel", "fallback_kernel")
 METRICS = {
     "us": ("gpu__time_duration.sum", {"ns": .001, "us": 1, "ms": 1000, "s": 1e6}),
@@ -33,7 +33,7 @@ METRICS = {
 def kernel_kind(name: str) -> str:
     if not any(token in name for token in CUSTOM_NAMES):
         raise ValueError(f"non-custom kernel in measured window: {name}")
-    for token in ("pack_rows_kernel", "finish_kernel", "linear_gemv_kernel", "decode_mma_kernel",
+    for token in ("pack_rows_kernel", "finish_kernel", "linear_gemv_kernel", "decode_warp_gemv_kernel", "decode_mma_kernel",
                   "decode_simt_kernel", "fp8_kernel", "gemm_kernel", "fallback_kernel"):
         if token in name:
             return token

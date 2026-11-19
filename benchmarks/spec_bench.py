@@ -130,13 +130,19 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
              request_metadata: list[dict] | None = None) -> dict:
     llm = LLM(args.model, speculative=speculative,
               medusa_path=args.medusa_path if speculative == "medusa" else "",
-              eagle_path=args.eagle_path if speculative == "eagle" else "",
+              eagle_path=(args.eagle3_path if speculative == "eagle3" else
+                          args.eagle_path if speculative in ("eagle", "eagle2") else ""),
               max_draft_len=args.max_draft_len,
+              eagle_tree_top_k=args.eagle_tree_top_k,
+              eagle_tree_max_nodes=args.eagle_tree_max_nodes,
+              enforce_eager=args.enforce_eager,
               kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
               max_model_len=args.max_model_len,
               max_num_seqs=max(8, len(prompts_tok)),
               gpu_memory_utilization=args.gpu_memory_utilization)
     try:
+        if args.cold_prefix:
+            llm.scheduler.block_manager.no_share = True
         if args.sampling_mode == "greedy":
             llm.model_runner.sampler.forward = lambda logits, _temps: logits.argmax(dim=-1)
         warmup_rng = random.Random(seed + 100003)
@@ -156,6 +162,58 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
             max_tokens=args.max_output_len,
             ignore_eos=args.ignore_eos,
         ) for _ in prompts_tok]
+        phase_events = {}
+        logit_trace = {}
+        if args.logit_diagnostics:
+            from nanovllm.engine.eagle_tree import verify_tree
+            from nanovllm.engine.ngram import verify_drafts
+
+            original_run = llm.model_runner.run
+
+            def diagnostic_run(seqs, kind, return_logits=False, return_hidden=False):
+                result = original_run(seqs, kind, True, return_hidden)
+                tokens, logits = result[:2]
+                scores, ids = logits.topk(2, dim=-1)
+                scores, ids = scores.tolist(), ids.tolist()
+                offset = 0
+                for seq in seqs:
+                    drafts = seq.draft_tokens
+                    count = 1 if drafts is None else len(drafts) + 1
+                    if drafts is None:
+                        path = [] if seq.is_prefill and seq.num_cached_tokens + seq.num_scheduled_tokens < len(seq) else [0]
+                    elif seq.draft_parents is None:
+                        _, accepted = verify_drafts(drafts, tokens[offset:offset + count])
+                        path = list(range(accepted))
+                    else:
+                        _, path = verify_tree(drafts, seq.draft_parents, tokens[offset:offset + count],
+                                              None if seq.ignore_eos else llm.config.eos)
+                    rows = logit_trace.setdefault(seq.seq_id, [])
+                    rows.extend(dict(top2=ids[offset + i], logits=scores[offset + i],
+                                     margin=scores[offset + i][0] - scores[offset + i][1]) for i in path)
+                    offset += count
+                if return_logits:
+                    return result
+                return (tokens, result[2]) if return_hidden else tokens
+
+            llm.model_runner.run = diagnostic_run
+        if args.phase_timing:
+            def measure(owner, method, name):
+                original = getattr(owner, method)
+
+                def measured(*inputs, **kwargs):
+                    label = name(inputs) if callable(name) else name
+                    begin = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    begin.record()
+                    result = original(*inputs, **kwargs)
+                    end.record()
+                    phase_events.setdefault(label, []).append((begin, end))
+                    return result
+
+                setattr(owner, method, measured)
+
+            measure(llm.model_runner, "run_model", lambda inputs: f"target_{inputs[2]}")
+            measure(llm, "_eagle3_drafts" if speculative == "eagle3" else "_eagle_drafts", "draft")
         started = time.perf_counter()
         outputs = llm.generate(prompts_tok, sampling_params, use_tqdm=False)
         torch.cuda.synchronize()
@@ -222,6 +280,14 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
             "prefill_steps": stats["prefill_steps"],
             "decode_steps": stats["decode_steps"],
             "spec_steps": stats.get("spec_steps", 0),
+            "decode_iterations": stats["decode_iterations"],
+            "output_tokens_per_target_decode_forward": (
+                stats["decode_tokens"] / max(1, stats["decode_iterations"])),
+            "verification_row_utilization": (
+                (stats["spec_accepted_drafts"] + stats["spec_rows"]) / stats["spec_verify_tokens"]
+                if stats["spec_verify_tokens"] else None),
+            "phase_gpu_ms": {label: sum(a.elapsed_time(b) for a, b in events)
+                             for label, events in phase_events.items()},
             "spec_verify_tokens": stats.get("spec_verify_tokens", 0),
             "spec_proposed_tokens": stats.get("spec_draft_tokens", 0),
             "spec_accepted_tokens": stats.get("spec_accepted_drafts", 0),
@@ -233,6 +299,9 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
             "output_token_fingerprint": hashlib.sha256(json.dumps(
                 [output["token_ids"] for output in outputs],
                 separators=(",", ":")).encode("utf-8")).hexdigest(),
+            "output_token_ids": [output["token_ids"] for output in outputs],
+            "logit_trace": ([logit_trace.get(row["seq_id"], []) for row in per_request]
+                            if args.logit_diagnostics else None),
             "content_metrics": {
                 "distinct_4": _summary([row["distinct_4"] for row in rows]),
                 "fourgram_repeat_rate": _summary(
@@ -332,9 +401,16 @@ def main() -> None:
     parser.add_argument("--chat-template", action="store_true",
                         help="wrap prompt-file user text with the tokenizer chat template")
     parser.add_argument("--speculative", default="none,ngram",
-                        help="comma-separated modes: none,ngram,medusa,eagle")
+                        help="comma-separated modes: none,ngram,medusa,eagle,eagle2,eagle3")
     parser.add_argument("--medusa-path", default="results/medusa_heads.pt")
     parser.add_argument("--eagle-path", default="results/eagle_layer.pt")
+    parser.add_argument("--eagle3-path", default="results/eagle3_qwen3_0.6b")
+    parser.add_argument("--eagle-tree-top-k", type=int, default=2)
+    parser.add_argument("--eagle-tree-max-nodes", type=int, default=8)
+    parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--cold-prefix", action="store_true", help="disable prefix cache sharing across all modes")
+    parser.add_argument("--phase-timing", action="store_true", help="diagnostic CUDA events; run separately from wall-clock timing")
+    parser.add_argument("--logit-diagnostics", action="store_true", help="record top-2 logits at visited rows in a separate greedy run")
     parser.add_argument("--max-draft-len", type=int, default=4,
                         help="fallback draft length gamma")
     parser.add_argument("--max-draft-lens", default=None,
@@ -377,12 +453,19 @@ def main() -> None:
     spec_modes = [item.strip() for item in args.speculative.split(",") if item.strip()]
     if not spec_modes or "none" not in spec_modes:
         raise ValueError("--speculative must include the none baseline")
-    if any(mode not in {"none", "ngram", "medusa", "eagle"} for mode in spec_modes):
+    if any(mode not in {"none", "ngram", "medusa", "eagle", "eagle2", "eagle3"} for mode in spec_modes):
         raise ValueError("unsupported speculative mode")
     if "medusa" in spec_modes and not os.path.isfile(args.medusa_path):
         raise FileNotFoundError(f"Medusa weights do not exist: {args.medusa_path}")
-    if "eagle" in spec_modes and not os.path.isfile(args.eagle_path):
+    if {"eagle", "eagle2"}.intersection(spec_modes) and not os.path.isfile(args.eagle_path):
         raise FileNotFoundError(f"EAGLE weights do not exist: {args.eagle_path}")
+    if "eagle3" in spec_modes:
+        args.eagle3_path = os.path.expanduser(args.eagle3_path)
+        for filename in ("config.json", "model.safetensors"):
+            if not (Path(args.eagle3_path) / filename).is_file():
+                raise FileNotFoundError(Path(args.eagle3_path) / filename)
+    if {"eagle2", "eagle3"}.intersection(spec_modes):
+        args.enforce_eager = True
     if args.chat_template and not args.prompts_file:
         raise ValueError("--chat-template requires --prompts-file")
 
@@ -438,6 +521,13 @@ def main() -> None:
         "prompts_file": args.prompts_file,
         "chat_template": args.chat_template,
         "max_model_len": args.max_model_len,
+        "enforce_eager": args.enforce_eager,
+        "cold_prefix": args.cold_prefix,
+        "phase_timing": args.phase_timing,
+        "logit_diagnostics": args.logit_diagnostics,
+        "eagle_tree_top_k": args.eagle_tree_top_k,
+        "eagle_tree_max_nodes": args.eagle_tree_max_nodes,
+        "eagle3_path": args.eagle3_path if "eagle3" in spec_modes else None,
     }
     completed_pair_keys = set()
     if args.resume:
@@ -566,6 +656,13 @@ def main() -> None:
                                 "alpha": run["alpha"],
                                 "spec_proposed_tokens": run["spec_proposed_tokens"],
                                 "spec_accepted_tokens": run["spec_accepted_tokens"],
+                                "tokens_per_target_decode_forward": run["output_tokens_per_target_decode_forward"],
+                                "verification_row_utilization": run["verification_row_utilization"],
+                                "draft_gpu_ms": run["phase_gpu_ms"].get("draft"),
+                                "target_verify_gpu_ms": sum(run["phase_gpu_ms"][phase]
+                                                            for phase in ("target_spec", "target_mixed")
+                                                            if phase in run["phase_gpu_ms"]) or None,
+                                "peak_memory_allocated_bytes": run["peak_memory_allocated_bytes"],
                                 "input_fingerprint": fingerprint,
                                 "output_token_fingerprint": run[
                                     "output_token_fingerprint"],
@@ -588,6 +685,19 @@ def main() -> None:
                             if speculative == "none":
                                 continue
                             measured = runs[speculative]
+                            first_differences = []
+                            for i, (expected, actual) in enumerate(zip(
+                                    baseline["output_token_ids"], measured["output_token_ids"])):
+                                if expected == actual:
+                                    continue
+                                pos = next((j for j, (a, b) in enumerate(zip(expected, actual)) if a != b),
+                                           min(len(expected), len(actual)))
+                                mismatch = dict(request=i, position=pos, baseline=expected[pos:pos + 1],
+                                                speculative=actual[pos:pos + 1])
+                                if args.logit_diagnostics:
+                                    mismatch["baseline_top2"] = baseline["logit_trace"][i][pos:pos + 1]
+                                    mismatch["speculative_top2"] = measured["logit_trace"][i][pos:pos + 1]
+                                first_differences.append(mismatch)
                             speedup = 100.0 * (
                                 measured["throughput_tok_per_s"]
                                 / max(baseline["throughput_tok_per_s"], 1e-12) - 1.0)
@@ -602,6 +712,8 @@ def main() -> None:
                                 "output_token_match": (
                                     measured["output_token_fingerprint"]
                                     == baseline["output_token_fingerprint"]),
+                                "matching_requests": len(metadata) - len(first_differences),
+                                "first_token_differences": first_differences,
                             }
                         pair_results.append({
                             "style": style,

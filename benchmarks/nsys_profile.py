@@ -127,7 +127,7 @@ def _module_range_label(model_type: str, module_name: str,
     return None
 
 
-def _install_nvtx_ranges(engine: LLM) -> tuple[list, int, dict[str, list[tuple]]]:
+def _install_nvtx_ranges(engine: LLM, *, cuda_events: bool = True) -> tuple[list, int, dict[str, list[tuple]]]:
     """Add profiling-only ranges without changing the engine implementation."""
     scheduler = engine.scheduler
     runner = engine.model_runner
@@ -166,6 +166,8 @@ def _install_nvtx_ranges(engine: LLM) -> tuple[list, int, dict[str, list[tuple]]
             phase = active_phase["kind"]
             annotated_label = f"{range_name} [{phase}]"
             torch.cuda.nvtx.range_push(annotated_label)
+            if not cuda_events:
+                return
             start = torch.cuda.Event(enable_timing=True)
             end = torch.cuda.Event(enable_timing=True)
             start.record()
@@ -173,9 +175,10 @@ def _install_nvtx_ranges(engine: LLM) -> tuple[list, int, dict[str, list[tuple]]
 
         def exit_range(_module, _inputs, _output, range_name=label,
                        active=active_events):
-            start, end, annotated_label = active.pop()
-            end.record()
-            gpu_events.setdefault(annotated_label, []).append((start, end))
+            if cuda_events:
+                start, end, annotated_label = active.pop()
+                end.record()
+                gpu_events.setdefault(annotated_label, []).append((start, end))
             torch.cuda.nvtx.range_pop()
 
         hooks.append(module.register_forward_pre_hook(enter))

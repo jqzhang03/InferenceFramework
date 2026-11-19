@@ -92,9 +92,18 @@ FP16 down 的主 kernel：grid 从 8 增至 64 CTA，registers/thread 从 128 �
 DeepSeek BF16 expert gate-up 浮点诊断：grid 22 → 88 CTA，registers/thread 128 → 54，DRAM 59.14% → 89.67%，shared-load conflicts 90112 → 0。
 其 Tensor 活动从 32.48% 降至 6.39%，但算子更快：原大 BM 含无效行运算，因此 Tensor 活动百分比不能单独代表有效计算效率。
 
-其余 FP16 gate-up、FP8 QKV 的逐 kernel 计数器见完整报告与原生文件。
+FP16 gate-up 从 GEMM10 改为 Decode26：grid 48→96 CTA，registers/thread 128→72，
+清缓存 DRAM sustained-peak 比例 80.42%→87.79%，shared-load conflicts 98317→3。
+该变化包含 tile、MMA 映射和线程工作量调整，不能单独归因于减少 warp。
+
+FP8 QKV 从 cfg3 改为 cfg0：主 kernel 的 grid 64→128 CTA，registers/thread 119→70，
+NCU occupancy 14.69%→27.84%，Tensor 活动 50.37%→60.13%，DRAM 48.93%→55.29%。
+shared-load conflicts 则从 0 增至 1986，仍取得完整操作延迟收益；不能以冲突计数单独判优。
+pack 保持原实现并计入正式时延。逐 kernel 原始单位与计数器见完整报告与原生文件。
 
 ## 验证与复现
+
+`--pipeline-pytest` 最终回归 **15 passed in 24.98s**。
 
 新增和原有 GPU 回归包含：FP16/BF16 边界尺寸、短 K、多阶段预取、非默认 stream、Graph 重放改变输入、swizzle/无 swizzle 一致性、FP8 动态量化，以及冻结 selector 的真实调用。
 保留现有 Qwen3-0.6B 默认 BF16 的八请求生成回归；本轮没有模型质量或模型吞吐结论。

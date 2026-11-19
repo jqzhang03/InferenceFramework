@@ -5,6 +5,24 @@ export CUDA_HOME=/usr/local/cuda
 export PATH="$CUDA_HOME/bin:/home/zjq/miniconda3/envs/nano-vllm/bin:$PATH"
 export CXX=/usr/bin/g++-13
 export MAX_JOBS=2
+if [[ "${1:-}" == "--eagle-study" ]]; then
+    shift
+    exec python -m benchmarks.spec_bench "$@"
+fi
+if [[ "${1:-}" == "--eagle-pytest" ]]; then
+    exec python -m pytest tests/test_eagle_tree.py tests/test_spec_decode.py tests/test_linear_backend_default.py -q
+fi
+if [[ "${1:-}" == "--down-history" ]]; then
+    shift
+    exec python -m benchmarks.cuda_down_history "$@"
+fi
+if [[ "${1:-}" == "--warp-gemv-study" ]]; then
+    shift
+    exec python -m benchmarks.cuda_warp_gemv_study "$@"
+fi
+if [[ "${1:-}" == "--warp-gemv-pytest" ]]; then
+    exec python -m pytest tests/test_cuda_pipeline.py tests/test_cuda_decode.py tests/test_cuda_linear.py tests/test_cuda_operator_profile.py -q
+fi
 if [[ "${1:-}" == "--pipeline-study" ]]; then
     shift
     exec python -m benchmarks.cuda_pipeline_study "$@"

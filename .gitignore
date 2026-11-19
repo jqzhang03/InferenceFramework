@@ -201,6 +201,8 @@ profiles/
 !benchmarks/run_cuda_gemm.sh
 draft_*
 !benchmarks/run_qwen_cuda.sh
+!benchmarks/run_deepseek_w4a16.sh
+!benchmarks/run_deepseek_w4a16.sh
 !tests/test_cuda_linear.py
 !tests/test_cuda_decode.py
 !tests/test_cuda_cfg22_diag.py

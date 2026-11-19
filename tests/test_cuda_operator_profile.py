@@ -41,9 +41,10 @@ def make_trace(path: Path, kernel_name: str) -> None:
         db.executemany("INSERT INTO StringIds VALUES (?,?)", [(1, kernel_name), (2, "reference_library_kernel"), (3, "cudaLaunchKernel")])
 
 
-def test_nsys_excludes_initialization_and_preserves_idle(tmp_path: Path) -> None:
+@pytest.mark.parametrize("kernel_name", ["void gemm_kernel<true>()", "void decode_warp_gemv_kernel<true, 4, 16, 2, 2>()"])
+def test_nsys_excludes_initialization_and_preserves_idle(tmp_path: Path, kernel_name: str) -> None:
     path = tmp_path / "trace.sqlite"
-    make_trace(path, "void gemm_kernel<true>()")
+    make_trace(path, kernel_name)
     row, = analyze_nsys(path)
     assert row["kernel_calls"] == 2
     assert row["operations"] == 96

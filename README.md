@@ -121,12 +121,25 @@ outputs[0]["text"]
 
 Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
 `nvfp4_backend="software|cublaslt"`,
-`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle"`, `rolling_cache=True`,
+`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3"`, `rolling_cache=True`,
 `kv_swap=True` (default), and `execution_mode="auto|mixed|pd"`. `example.py` is an end-to-end demo; `benchmarks/bench.py` produces
 the full TTFT/TPOT/E2E/p50/p99/SLO report and a JSON artifact under `results/`.
+
+Qwen3-0.6B supports EAGLE-2 and EAGLE-3 on one GPU with BF16 weights and ordinary
+paged KV. These modes execute eagerly. EAGLE-2 takes the same local `eagle_path`
+`.pt` file as EAGLE-1. EAGLE-3 takes a local directory containing `config.json`
+and `model.safetensors` from the supported Qwen3-0.6B draft checkpoint. Its draft
+KV is initialized during prefill, so it uses private target prefix blocks and
+recomputes preempted requests. Set `max_draft_len`, `eagle_tree_top_k`, and
+`eagle_tree_max_nodes` to control tree depth, frontier width, and draft node budget.
+
 For pure INT4 MoE experts, `moe_int4_backend="loop|segment"` selects the per-expert or
 segmented GEMM path; `moe_int4_fuse_gate_up` controls gate/up launch fusion on the segmented
 path.
+
+DeepSeek-V2-Lite defaults to native CUDA W4A16 for single-GPU INT4 inference with
+`int4_group_size=64` and the `loop` expert backend. Set `int4_kernel_backend="triton"`
+to run the Triton baseline. Weight quantization is enabled with `quantization="int4"`.
 
 The 2026-10-12 DeepSeek-V2-Lite fixed-shape diagnostic matched split/fused token outputs
 in every random and greedy correctness case and found bitwise-equal sentinel logits and MoE
@@ -975,6 +988,37 @@ representative cases three times in each cache regime; explicit `--case` samples
 every selected case. Split-K finish and FP8 pack kernels are retained. NCU replay
 durations are diagnostic; use the independent timings to evaluate changes.
 See the [2026-11-17 profiling report](benchmarks/_cuda_operator_profile_20261117.md).
+
+### CUDA tile and pipeline tuning
+
+```bash
+bash benchmarks/run_qwen_cuda.sh --pipeline-study --output profiles/cuda_pipeline_NEW
+bash benchmarks/run_qwen_cuda.sh --pipeline-pytest
+```
+
+The [2026-11-17 tuning study](benchmarks/_cuda_pipeline_20261117.md) screens
+1176 configurations and validates candidates on three held-out seeds with
+resident and rotating weights. It preserves 87 native NCU reports, including
+fixed-geometry warp, stage and shared-layout controls. Fifteen GPU tests pass.
+Measured FP16 B8 projection and FP8 M128 QKV winners use bundled device/dtype
+selectors on RTX 5060 Ti; default BF16 selectors stay unchanged. Full-operation
+timings include Split-K finish and FP8 activation packing. These are operator
+results; DeepSeek floating-point probes do not represent deployed INT4 inference.
+
+### Warp-owned GEMV for M=1–4
+
+```bash
+bash benchmarks/run_qwen_cuda.sh --warp-gemv-study --output profiles/cuda_warp_gemv_NEW
+bash benchmarks/run_qwen_cuda.sh --warp-gemv-pytest
+```
+
+The [warp GEMV follow-up](benchmarks/_cuda_warp_gemv_20261117.md) adds Decode38–49:
+8/16/32-lane shuffle reductions, register reuse across requests and outputs, and
+one/two independent accumulation chains, without shared memory or CTA barriers.
+Three held-out seeds accepted six BF16 M2/M3 shapes and twelve FP16 M2-4 shapes
+against the prior runtime on RTX 5060 Ti; these now use bundled cuda_decode
+selectors. M1, BF16 M4 and M8+ keep their prior choices. Measurements cover
+operators, with ordinary GEMV/shared SIMT controls and native NCU reports.
 
 ## License
 

@@ -45,6 +45,19 @@ class ExpertFFN(nn.Module):
                                            bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        full = getattr(self, "_cuda_int4_fusion", None)
+        if full is not None and x.ndim == 2 and 0 < x.size(0) <= 4:
+            gate, up, down = self.gate_proj, self.up_proj, self.down_proj
+            if (x.is_contiguous() and x.data_ptr() % 16 == 0
+                    and x.dtype in (torch.float16, torch.bfloat16)
+                    and x.dtype == gate.w_int4_scale.dtype and x.device == gate.w_int4.device
+                    and getattr(gate, "_cuda_int4_ext", None) is not None):
+                hidden = x.new_empty((x.size(0), gate.w_int4.size(0)))
+                out = x.new_empty((x.size(0), down.w_int4.size(0)))
+                if gate._cuda_int4_ext.expert_out(
+                        x, gate.w_int4, gate.w_int4_scale, up.w_int4, up.w_int4_scale,
+                        down.w_int4, down.w_int4_scale, hidden, out, full):
+                    return out
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
 
 

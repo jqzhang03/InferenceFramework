@@ -202,12 +202,18 @@ class Qwen3Model(nn.Module):
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-    ) -> torch.Tensor:
+        *, capture_eagle3: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         hidden_states = self.embed_tokens(input_ids)
         residual = None
-        for layer in self.layers:
+        features = []
+        for i, layer in enumerate(self.layers):
             hidden_states, residual = layer(positions, hidden_states, residual)
+            if capture_eagle3 and i in (1, 13, 24):
+                features.append(hidden_states + residual)
         hidden_states, _ = self.norm(hidden_states, residual)
+        if capture_eagle3:
+            return hidden_states, torch.cat(features, dim=-1)
         return hidden_states
 
 # 用于因果语言模型的完整Qwen3，包含主体和LM Head

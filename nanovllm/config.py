@@ -69,12 +69,17 @@ class Config:
     ngram_min_window: int = 1 # n-gram窗口下限（先长后短回退，vLLM --ngram-prompt-lookup-min 默认同款）
     max_draft_len: int = 4 # 每步最大草稿数γ（vLLM --num-speculative-tokens 常用值）
     medusa_path: str = "" # Medusa头权重文件（.pt，benchmarks/medusa_train.py训练产出）；speculative="medusa"时必须
-    eagle_path: str = "" # EAGLE草稿层权重文件（.pt，benchmarks/eagle_train.py训练产出）；speculative="eagle"时必须
+    eagle_path: str = "" # local .pt for EAGLE-1/2, checkpoint directory for EAGLE-3
+    eagle_tree_top_k: int = 2
+    eagle_tree_max_nodes: int = 8 # candidate nodes, excluding the already emitted root token
     medusa_hidden: int = 256 # Medusa头隐藏维（输出层256×vocab是主要参数，控制总规模）
     prefix_cache_max_free_blocks: int = 0 # 空闲前缀缓存块上限；0表示不设上限，分配压力下按LRU回收
     mixed_cudagraph: bool = True # 普通混合Prefill/Decode批次使用按形状惰性捕获的CUDA Graph
     mixed_cudagraph_max_graphs: int = 4 # 混合图形状缓存上限，超限淘汰最久未使用图
     mixed_cudagraph_max_tokens: int = 4096 # 超过该批次token数时走eager，限制图捕获峰值显存
+
+    int4_kernel_backend: str | None = None # None selects the model default for packed W4A16 GEMM
+    cuda_int4_expert_fusion: str = "none" # none | gate_up | full (cooperative launch)
 
     def __post_init__(self):
         assert self.linear_backend in (None, "torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto")
@@ -139,12 +144,16 @@ class Config:
                 "当前 PD 分离版本暂不支持 rolling_cache"
             assert self.kv_cache_dtype == "auto", \
                 "当前 PD KV 传输暂要求 kv_cache_dtype='auto'"
-        assert self.speculative in ("none", "ngram", "medusa", "eagle"), \
+        assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3"), \
             f"unknown speculative: {self.speculative}"
         assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "awq", "sparse24", "fp8"), \
             f"unknown quantization: {self.quantization}"
         assert self.moe_int4_backend in ("loop", "segment"), \
             f"unknown MoE INT4 backend: {self.moe_int4_backend!r}"
+        assert self.int4_kernel_backend in (None, "triton", "cuda"), \
+            f"unknown INT4 kernel backend: {self.int4_kernel_backend!r}"
+        assert self.cuda_int4_expert_fusion in ("none", "gate_up", "full"), \
+            f"unknown CUDA INT4 expert fusion: {self.cuda_int4_expert_fusion!r}"
         assert self.nvfp4_backend in ("software", "cublaslt"), \
             f"unknown NVFP4 backend: {self.nvfp4_backend}"
         if self.nvfp4_backend == "cublaslt":
@@ -152,9 +161,30 @@ class Config:
                 "nvfp4_backend='cublaslt' requires quantization='nvfp4'"
         if self.speculative == "medusa":
             assert self.medusa_path, "speculative=medusa requires medusa_path"
-        if self.speculative == "eagle":
-            assert self.eagle_path, "speculative=eagle requires eagle_path"
+        if self.speculative in ("eagle", "eagle2", "eagle3"):
+            assert self.eagle_path, f"speculative={self.speculative} requires eagle_path"
         self.hf_config = AutoConfig.from_pretrained(self.model)
+        if self.speculative in ("eagle2", "eagle3"):
+            hf = self.hf_config
+            shape = tuple(getattr(hf, key, None) for key in (
+                "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",
+                "num_attention_heads", "num_key_value_heads", "head_dim", "vocab_size"))
+            assert shape == ("qwen3", 1024, 28, 3072, 16, 8, 128, 151936), \
+                "EAGLE-2/3 currently require Qwen3-0.6B"
+            assert str(hf.dtype) in ("torch.bfloat16", "bfloat16") and self.tensor_parallel_size == 1 \
+                and self.quantization == "none" and self.kv_cache_dtype == "auto" and not self.rolling_cache, \
+                "EAGLE-2/3 require single-GPU BF16 with unquantized paged KV and weights"
+            assert 1 <= self.eagle_tree_top_k <= 8 and 1 <= self.max_draft_len <= 8 \
+                and 1 <= self.eagle_tree_max_nodes <= 32, "invalid EAGLE tree budget"
+            self.enforce_eager = True
+        if self.int4_kernel_backend is None:
+            self.int4_kernel_backend = self._default_int4_kernel_backend()
+        if self.int4_kernel_backend == "cuda":
+            assert self.quantization == "int4" and self.moe_int4_backend == "loop", \
+                "CUDA W4A16 requires quantization='int4' and moe_int4_backend='loop'"
+        if self.cuda_int4_expert_fusion != "none":
+            assert self.int4_kernel_backend == "cuda" and self.tensor_parallel_size == 1, \
+                "CUDA INT4 expert fusion requires the CUDA W4A16 backend and TP=1"
         if self.linear_backend is None:
             self.linear_backend = self._default_linear_backend()
         if self.linear_backend != "torch":
@@ -181,6 +211,20 @@ class Config:
                 and dtype in ("torch.float16", "torch.bfloat16", "float16", "bfloat16")):
             return "cuda_decode"
         return "torch"
+
+    def _default_int4_kernel_backend(self) -> str:
+        hf = self.hf_config
+        shape = tuple(getattr(hf, key, None) for key in (
+            "hidden_size", "intermediate_size", "moe_intermediate_size",
+            "num_hidden_layers", "n_routed_experts"))
+        if (getattr(hf, "model_type", None) == "deepseek_v2"
+                and shape == (2048, 10944, 1408, 27, 64)
+                and str(getattr(hf, "dtype", None)) in ("torch.float16", "torch.bfloat16", "float16", "bfloat16")
+                and self.quantization == "int4" and self.int4_group_size == 64
+                and self.moe_int4_backend == "loop" and self.tensor_parallel_size == 1
+                and self.execution_mode != "pd"):
+            return "cuda"
+        return "triton"
 
     def pd_mode_incompatibility(self) -> str | None:
         """Return why PD mode cannot run with this configuration, if applicable."""

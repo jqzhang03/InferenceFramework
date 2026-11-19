@@ -47,6 +47,8 @@ class Sequence:
         self.is_prefill = True
         self.block_table = []
         self.draft_tokens: list[int] | None = None  # 投机解码：本步n-gram草稿（None=非verify行；[]=verify行无草稿）
+        self.draft_parents: list[int] | None = None # one parent row per draft, root is row zero
+        self.eagle3_kv = None
         self.spec_proposed_tokens = 0
         self.spec_accepted_tokens = 0
         self.spec_verify_steps = 0
@@ -153,6 +155,8 @@ class Sequence:
             self.last_token = last_state
         self.num_prefix_cached_tokens = 0
         self.prefix_feature_context = None
+        self.draft_parents = None
+        self.eagle3_kv = None
         self.t_submitted = None
         self.t_prefill_started = None
         self.t_first_token = None

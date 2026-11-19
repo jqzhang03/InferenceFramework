@@ -6,6 +6,68 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_warp_gemv_candidates(dtype):
+    from nanovllm.layers.cuda_linear import load_decode_extension
+    ext = load_decode_extension()
+    stream = torch.cuda.Stream()
+    torch.manual_seed(811)
+    with torch.cuda.stream(stream):
+        for m in range(1, 5):
+            for n, k in ((1, 8), (17, 144), (71, 520), (129, 1024)):
+                x = torch.randn(m, k, device="cuda", dtype=dtype)
+                w = torch.randn(n, k, device="cuda", dtype=dtype)
+                out = torch.empty(m, n, device="cuda", dtype=dtype)
+                reference = x.double() @ w.double().T
+                limit = .001 if dtype == torch.float16 else .006
+                for config in range(38, 50):
+                    ext.decode_out(x, w, out, config)
+                    assert torch.isfinite(out).all()
+                    assert (out.double()-reference).norm()/reference.norm().clamp_min(1e-12) < limit
+                    graph = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(graph, stream=stream):
+                        ext.decode_out(x, w, out, config)
+                    x.add_(.125)
+                    w.mul_(-1)
+                    graph.replay()
+                    reference = x.double() @ w.double().T
+                    assert (out.double()-reference).norm()/reference.norm().clamp_min(1e-12) < limit
+                empty_x = torch.empty(m, 0, device="cuda", dtype=dtype)
+                empty_w = torch.empty(n, 0, device="cuda", dtype=dtype)
+                ext.decode_out(empty_x, empty_w, out, 38)
+                assert torch.count_nonzero(out) == 0
+    stream.synchronize()
+
+
+def test_warp_gemv_rejects_large_batch():
+    from nanovllm.layers.cuda_linear import load_decode_extension
+    x = torch.empty(5, 8, device="cuda", dtype=torch.float16)
+    w = torch.empty(17, 8, device="cuda", dtype=torch.float16)
+    out = torch.empty(5, 17, device="cuda", dtype=torch.float16)
+    with pytest.raises(RuntimeError, match="warp GEMV requires M<=4"):
+        load_decode_extension().decode_out(x, w, out, 38)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_warp_gemv_adapter_graph(dtype):
+    from nanovllm.layers.cuda_linear import CudaLinear, load_extension, load_decode_extension
+    weight = torch.randn(71, 520, device="cuda", dtype=dtype)
+    bias = torch.randn(71, device="cuda", dtype=dtype)
+    selectors = {f"{m},71,520": dict(mode="decode", config=49) for m in range(1, 5)}
+    adapter = CudaLinear(weight, "cuda_decode", load_extension(), selectors=selectors,
+                         decode_ext=load_decode_extension())
+    for m in range(1, 5):
+        x = torch.randn(m, 520, device="cuda", dtype=dtype)
+        adapter(x, bias)
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            output = adapter(x, bias)
+        x.mul_(.5)
+        graph.replay()
+        expected = (x.double() @ weight.double().T).to(dtype) + bias
+        assert (output.double()-expected.double()).norm()/expected.double().norm() < (.002 if dtype == torch.float16 else .012)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 def test_decode_pipeline_candidates(dtype):
     from nanovllm.layers.cuda_linear import load_decode_extension
     ext = load_decode_extension()
@@ -80,6 +142,10 @@ def test_fp8_pipeline_candidates():
 
 
 @pytest.mark.parametrize("backend,dtype,m,n,k,config", [
+    ("cuda_decode", torch.bfloat16, 2, 6144, 1024, 49),
+    ("cuda_decode", torch.bfloat16, 3, 6144, 1024, 40),
+    ("cuda_decode", torch.float16, 2, 4096, 1024, 45),
+    ("cuda_decode", torch.float16, 4, 6144, 1024, 48),
     ("cuda_decode", torch.float16, 8, 6144, 1024, 26),
     ("cuda_decode", torch.float16, 8, 1024, 3072, 7),
     ("cuda_fp8", torch.bfloat16, 128, 4096, 1024, 0),

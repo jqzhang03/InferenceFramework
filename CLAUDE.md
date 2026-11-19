@@ -1,5 +1,22 @@
 # CLAUDE.md
 
+Warp GEMV follow-up (2026-11-17): --warp-gemv-study --output <fresh-dir> and
+--warp-gemv-pytest cover M1-4 Decode38–49 (warp/subwarp-owned outputs, register
+weight reuse, shuffle reduction, no shared/CTA barrier). Bundled cuda_decode
+selectors now enable six BF16 M2/M3 shapes and twelve FP16 M2-4 shapes on RTX5060Ti;
+M1, BF16 M4 and M8+ choices stay unchanged. Historical BF16-unchanged statements
+refer to the preceding pipeline study. See benchmarks/_cuda_warp_gemv_20261117.md.
+
+CUDA pipeline follow-up (2026-11-17): --pipeline-study --output <fresh-dir>
+screens tile/warp/stage configurations and validates held-out seeds with NCU
+controls; --pipeline-pytest passed 15 GPU tests. New IDs are Decode24–37,
+GEMM24–35 and FP8 28–33. Device/dtype-matched bundled selectors enable FP16
+cuda_decode B8 projections and BF16-activation cuda_fp8 M128 QKV on RTX5060Ti.
+Default BF16 cuda_decode stays unchanged; explicit tuning wins. Preserve native
+reports, finish/pack kernels and independent graph timings. Shared-conflict
+reductions alone did not establish wins. See benchmarks/_cuda_pipeline_20261117.md
+and profiles/cuda_pipeline_20261117/ (87 NCU captures, 111 kernel instances).
+
 Custom-only CUDA profiling: run_qwen_cuda.sh --operator-profile --output <fresh-dir>
 collects independent three-seed resident/rotating28 timings, eager/graph Systems
 timelines and warm/flushed-cache Compute counters. --operator-pytest validates

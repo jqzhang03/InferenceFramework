@@ -93,7 +93,7 @@ class Scheduler:
             self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                               rolling_window=ring_window,
                                               ring_slack=config.max_draft_len + 2,
-                                              no_share=config.pd_separation,
+                                              no_share=config.pd_separation or config.speculative == "eagle3",
                                               max_free_prefix_blocks=config.prefix_cache_max_free_blocks,
                                               prefix_feature_cache=config.prefix_feature_cache)
             self.full_block_manager = None
@@ -132,7 +132,7 @@ class Scheduler:
         self._swap_buffers: dict[int, object] = {}  # seq_id → CPU 缓冲（换出时分配，换入后释放）
         # FP8 KV 在 CPU 侧按 uint8 原始字节保存并往返，避免 float8 的 CPU 算子限制。
         # TP>1 的 spawn 进程尚未实现每个 rank 的独立 offload buffer，因此仍回退 recompute。
-        self.kv_swap = config.kv_swap and config.tensor_parallel_size == 1
+        self.kv_swap = config.kv_swap and config.tensor_parallel_size == 1 and config.speculative != "eagle3"
         self._swap_max_bytes = int(config.kv_swap_space_gb * 1e9)
         self._swap_bytes = 0  # 当前换出缓冲累计字节（超预算回落 recompute）
         if self.kv_swap:
@@ -170,7 +170,7 @@ class Scheduler:
             # Retain the aggregate for callers that only need an upper-bound estimate.
             self._swap_bytes_per_block = sum(self._swap_pool_bytes_per_block.values())
         # ---- 投机解码（n-gram / Medusa） ----
-        self.spec_decode = config.speculative in ("ngram", "medusa", "eagle")
+        self.spec_decode = config.speculative in ("ngram", "medusa", "eagle", "eagle2", "eagle3")
         self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
         self.ngram_window = config.ngram_window
         self.ngram_min_window = config.ngram_min_window
@@ -567,7 +567,7 @@ class Scheduler:
                 return self._schedule_mixed()
             if self.waiting:
                 return self._schedule_prefill()
-            if any(seq.draft_tokens for seq in self.running):
+            if self.spec_mode in ("eagle", "eagle2", "eagle3") or any(seq.draft_tokens for seq in self.running):
                 return self._schedule_spec()
             for seq in self.running:
                 seq.draft_tokens = None
@@ -616,7 +616,7 @@ class Scheduler:
         上限 = min(最大草稿数, 剩余输出预算-1)：每步至少产出1个token（bonus/
         拒绝样本），所以草稿数最多 = remaining-1，保证追加后不超max_tokens。
         """
-        if self.spec_mode in ("medusa", "eagle") and seq.draft_tokens is not None:
+        if self.spec_mode in ("medusa", "eagle", "eagle2", "eagle3") and seq.draft_tokens is not None:
             return  # engine已设置（GPU头前向/草稿层自回归），保持
         remaining = seq.max_tokens - seq.num_completion_tokens - 1
         max_len = min(self.max_draft_len, remaining)
@@ -717,12 +717,14 @@ class Scheduler:
         """
         rows = []
         used = 0
-        while self.running and len(rows) < max_rows:
+        while self.running and len(rows) < max_rows and used < budget:
             seq = self.running.popleft()
             n = len(seq.draft_tokens) + 1
             avail = max(1, budget - used)
             if n > avail:
                 seq.draft_tokens = seq.draft_tokens[:avail - 1]
+                if seq.draft_parents is not None:
+                    seq.draft_parents = seq.draft_parents[:avail - 1]
                 n = avail
             while not self.block_manager.can_append_spec(seq, n):
                 if self.running:
@@ -1017,6 +1019,8 @@ class Scheduler:
             seq.status = SequenceStatus.WAITING
             seq.is_prefill = True
             seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
+            seq.draft_parents = None
+            seq.eagle3_kv = None
             seq.swapped = False
             self.block_manager.deallocate(seq)
             if self.full_block_manager is not None and seq.kv_table:
@@ -1034,6 +1038,7 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = False       # 恢复时直接 decode，不是 prefill
         seq.draft_tokens = None
+        seq.draft_parents = None
         seq.swapped = True
         # 注意：decode 序列最后 token 的块可能未分配（can_append 失败正是缺这块）
         # → 只换出已有块；恢复后本步 decode 正常追加。普通模式只有一个 KV 池；
@@ -1166,6 +1171,7 @@ class Scheduler:
                     seq.num_cached_tokens = seq.num_tokens
                     seq.num_scheduled_tokens = 0
                     seq.draft_tokens = None
+                    seq.draft_parents = None
                     self._maybe_finish(seq, tokens[-1])
                 else:
                     self.block_manager.hash_blocks(seq, seq.is_prefill)

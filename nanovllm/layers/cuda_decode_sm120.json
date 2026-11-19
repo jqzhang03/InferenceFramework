@@ -129,9 +129,34 @@
     "1024,1024,3072": {
       "mode": "gemm",
       "config": 5
+    },
+    "2,4096,1024": {
+      "mode": "decode",
+      "config": 49
+    },
+    "2,6144,1024": {
+      "mode": "decode",
+      "config": 49
+    },
+    "3,4096,1024": {
+      "mode": "decode",
+      "config": 44
+    },
+    "3,1024,2048": {
+      "mode": "decode",
+      "config": 38
+    },
+    "3,6144,1024": {
+      "mode": "decode",
+      "config": 40
+    },
+    "3,1024,3072": {
+      "mode": "decode",
+      "config": 40
     }
   },
   "selection_policy": "M=1 retains old GEMV; M>1 enables new path only if training rotating-weight time improves >=2%",
   "dtype": "bfloat16",
-  "source": "2026-11-16 Qwen3-0.6B, rotating 28 weight buffers; other devices/dtypes/shapes retain legacy dispatch"
+  "source": "2026-11-16 Qwen3-0.6B, rotating 28 weight buffers; other devices/dtypes/shapes retain legacy dispatch",
+  "warp_gemv_selection_policy": "2026-11-17: seed17 screen; held-out42/99/123; rotating median >=3% gain; no >2% rotating or >5% resident regression; see benchmarks/_cuda_warp_gemv_20261117.md"
 }

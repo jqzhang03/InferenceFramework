@@ -4,9 +4,70 @@
   "dtype": "fp16",
   "selection_policy": "2026-11-17: seed17 screen; held-out42/99/123; rotating median >=3% gain; no >2% rotating or >5% resident regression",
   "selectors": {
-    "8,4096,1024": {"mode": "decode", "config": 2},
-    "8,1024,2048": {"mode": "decode", "config": 7},
-    "8,6144,1024": {"mode": "decode", "config": 26},
-    "8,1024,3072": {"mode": "decode", "config": 7}
-  }
+    "8,4096,1024": {
+      "mode": "decode",
+      "config": 2
+    },
+    "8,1024,2048": {
+      "mode": "decode",
+      "config": 7
+    },
+    "8,6144,1024": {
+      "mode": "decode",
+      "config": 26
+    },
+    "8,1024,3072": {
+      "mode": "decode",
+      "config": 7
+    },
+    "2,4096,1024": {
+      "mode": "decode",
+      "config": 45
+    },
+    "2,1024,2048": {
+      "mode": "decode",
+      "config": 40
+    },
+    "2,6144,1024": {
+      "mode": "decode",
+      "config": 41
+    },
+    "2,1024,3072": {
+      "mode": "decode",
+      "config": 38
+    },
+    "3,4096,1024": {
+      "mode": "decode",
+      "config": 48
+    },
+    "3,1024,2048": {
+      "mode": "decode",
+      "config": 38
+    },
+    "3,6144,1024": {
+      "mode": "decode",
+      "config": 40
+    },
+    "3,1024,3072": {
+      "mode": "decode",
+      "config": 40
+    },
+    "4,4096,1024": {
+      "mode": "decode",
+      "config": 45
+    },
+    "4,1024,2048": {
+      "mode": "decode",
+      "config": 38
+    },
+    "4,6144,1024": {
+      "mode": "decode",
+      "config": 48
+    },
+    "4,1024,3072": {
+      "mode": "decode",
+      "config": 39
+    }
+  },
+  "warp_gemv_selection_policy": "2026-11-17: seed17 screen; held-out42/99/123; rotating median >=3% gain; no >2% rotating or >5% resident regression; see benchmarks/_cuda_warp_gemv_20261117.md"
 }

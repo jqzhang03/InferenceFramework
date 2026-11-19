@@ -155,8 +155,8 @@ def gemm_int4_kernel(
                         mask=offs_n < N, other=1.0)
             lo = ((b8 & 0x0F) - 8).to(tl.float32) * s[None, :]
             hi = (((b8 >> 4) & 0x0F) - 8).to(tl.float32) * s[None, :]
-            acc += tl.dot(a_e, lo.to(tl.bfloat16), out_dtype=tl.float32)
-            acc += tl.dot(a_o, hi.to(tl.bfloat16), out_dtype=tl.float32)
+            acc += tl.dot(a_e, lo.to(a_e.dtype), out_dtype=tl.float32)
+            acc += tl.dot(a_o, hi.to(a_o.dtype), out_dtype=tl.float32)
 
     c_ptrs = c_ptr + offs_m[:, None] * stride_cm + offs_n[None, :] * stride_cn
     tl.store(c_ptrs, acc, mask=a_mask & b_mask)
@@ -179,7 +179,7 @@ def int4_gemm(a: torch.Tensor, b_int4: torch.Tensor, b_scale: torch.Tensor) -> t
     group = K // num_groups
     assert group * num_groups == K and group % 2 == 0 \
         and 128 % group == 0, f"组 {group} 须整除 K 且 128%组==0（K={K}）"
-    out = torch.empty(M, N, device=a.device, dtype=torch.bfloat16)
+    out = torch.empty(M, N, device=a.device, dtype=a.dtype)
     bm, bn, warps = 16, 128, 4
     grid = (triton.cdiv(M, bm) * triton.cdiv(N, bn),)
     gemm_int4_kernel[grid](
@@ -628,7 +628,12 @@ class WeightQuantMixin:
         awq = getattr(self, "awq_scale", None)
         if awq is not None:
             x = x / awq[None, :]  # AWQ恒等变换的激活侧（权重侧已折叠 W'=W·s）
-        y = int4_gemm(x, self.w_int4, self.w_int4_scale)
+        extension = getattr(self, "_cuda_int4_ext", None)
+        if extension is None:
+            y = int4_gemm(x, self.w_int4, self.w_int4_scale)
+        else:
+            from nanovllm.layers.cuda_int4 import cuda_int4_gemm
+            y = cuda_int4_gemm(x, self.w_int4, self.w_int4_scale, extension)
         if bias is not None:
             y = y + bias
         return y

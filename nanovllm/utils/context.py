@@ -1,5 +1,9 @@
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 import torch
+
+if TYPE_CHECKING:
+    from nanovllm.engine.eagle_tree import TreeAttentionBatch
 
 
 @dataclass(slots=True)
@@ -39,6 +43,7 @@ class Context:
     full_block_tables: torch.Tensor | None = None
     full_slot_mapping: torch.Tensor | None = None
     full_prefill_block_tables: torch.Tensor | None = None
+    tree_attention: "TreeAttentionBatch | None" = None
 
 _CONTEXT = Context()
 

@@ -2297,6 +2297,49 @@ kernel 时间约 7.75%；继续按主 kernel 的流水/寄存器/布局进行对
 原生报告和原始数据在 `profiles/cuda_operator_20261117/`。
 复现：`bash benchmarks/run_qwen_cuda.sh --operator-profile --output <fresh-dir>`。
 
+### 10.3.33 2026-11-17 CUDA 并行度、每线程工作量与流水对照
+
+在已有 cp.async 双缓冲上增加 Decode cfg24–37、GEMM cfg24–35、FP8 cfg28–33，
+保留旧编号；筛选 1176 个配置后，以三个独立 seed 验证 resident/rotating28。
+共 192 组验证计时、102 组固定几何对照，以及 87 份原生 NCU 报告。
+正式延迟使用无 profiler 的 Graph 计时，包含 Split-K finish 和 FP8 pack。
+
+启用 RTX 5060 Ti 的 FP16 B8 selector：O 从 43.431 降至 12.712 μs，
+down 从 63.488 降至 17.210 μs，gate-up 从 34.680 降至 32.045 μs。
+FP8 M128 QKV 从 22.330 降至 19.555 μs；当前默认 BF16 未通过替换门槛，保持原配置。
+这些是旋转权重的算子结果，没有模型吞吐或 cuBLAS 对比结论；DeepSeek 浮点探针不部署到 INT4 MoE。
+
+固定 BF16 O 几何，将 4 warp 改为 2 warp，每线程承担更多加载和 MMA：
+寄存器 54→72，resident 8.371→13.412 μs，且两者 shared-load conflict 都为零。
+Prefill 备用 A swizzle 将约 80 万次冲突降至约 1 万次，但寄存器 128→130，
+寄存器限制的驻留块数 4→3，rotating28 168.624→173.211 μs，因此不部署。
+不能用单个冲突或 Tensor 活动指标替代实际操作延迟。
+
+GPU 回归 15 项通过，覆盖边界、FP16/BF16/FP8 精度、非默认 stream、Graph 改变输入，
+以及新 selector 实际调用和原默认 BF16 八请求生成。
+详见 [调优报告](benchmarks/_cuda_pipeline_20261117.md)；原始数据在
+`profiles/cuda_pipeline_20261117/`。复现入口为 `--pipeline-study` 和 `--pipeline-pytest`。
+
+### 10.3.34 2026-11-17 M1～4 warp 独立 GEMV
+
+`decode_warp_gemv_kernel` 新增 cfg38–49，按 M1/2/3/4 特化，每个 8/16/32 lane
+组负责 1/2 个输出，权重在请求行间复用，激活在输出间复用，使用 1/2 条累加链及
+shuffle 归约，无 shared、块级屏障和 Split-K 缓冲。原普通 GEMV 本就没有块级同步，
+因此不能将相比它的全部收益归因于移除同步。
+
+Qwen 四投影 × 两种精度 × M1～4，共 32 算例；452 组 resident 筛选、600 组独立验证记录。
+seed17 选配置，42/99/123 验证 resident/rotating28，达到同一替换门槛后才部署。
+BF16 通过 M2 QKV/gate-up、M3 四投影（6 个）；FP16 通过 M2～4 四投影（12 个）。
+BF16 M3 gate-up 旋转权重 41.778→31.834 μs，FP16 M4 gate-up 48.328→32.040 μs。
+M1 和已有较快 BF16 M4 路径未替换；FP16 M4 原为普通 GEMV，不能将其收益解释为精度差异。
+每线程一次读取 16 字节权重后复用多行，减少加载指令；实际 DRAM 流量仍取决于缓存。
+
+最终回归 29 项通过（24 项 GPU、5 项解析），12 份原生 NCU 报告全部成功；
+两组新 warp 对照的静态/动态 shared 和 barrier 等待均为零，无观测到的 local spill。
+复现：`--warp-gemv-study --output <fresh-dir>`、`--warp-gemv-pytest`。
+详见 [warp GEMV 报告](benchmarks/_cuda_warp_gemv_20261117.md) 与
+`profiles/cuda_warp_gemv_20261117/`；不声称 cuBLAS 对比或模型吞吐加速。
+
 ### 10.4 Profiling
 
 **torch.profiler（CPU 侧；WSL 下 CUPTI 不可用，无 CUDA kernel 时间）**：

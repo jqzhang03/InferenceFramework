@@ -139,6 +139,64 @@ __global__ void decode_simt_kernel(const unsigned short* x,const unsigned short*
     }
 }
 
+// Every lane group owns its outputs across all K and all request rows. X and W
+// stay in registers: no shared-memory exchange, CTA barrier or partial buffer.
+// All 128 threads execute every shuffle, including predicated boundary outputs.
+template<bool BF,int ROWS,int LANES,int OUTPUTS,int CHAINS>
+__global__ void decode_warp_gemv_kernel(const unsigned short* x,const unsigned short* w,
+    unsigned short* out,int N,int K) {
+    constexpr int NT=128,GROUPS=NT/LANES;
+    int lane=threadIdx.x%LANES;
+    int n0=(blockIdx.x*GROUPS+threadIdx.x/LANES)*OUTPUTS;
+    float accum[ROWS][OUTPUTS][CHAINS]={};
+    for(int k=lane*8;k<K;k+=LANES*8) {
+        uint4 weights[OUTPUTS];
+        #pragma unroll
+        for(int o=0;o<OUTPUTS;++o) {
+            weights[o]={0,0,0,0};
+            if(n0+o<N)weights[o]=*reinterpret_cast<const uint4*>(w+int64_t(n0+o)*K+k);
+        }
+        #pragma unroll
+        for(int r=0;r<ROWS;++r) {
+            uint4 activation=*reinterpret_cast<const uint4*>(x+int64_t(r)*K+k);
+            auto xp=reinterpret_cast<const unsigned short*>(&activation);
+            #pragma unroll
+            for(int o=0;o<OUTPUTS;++o) {
+                auto wp=reinterpret_cast<const unsigned short*>(&weights[o]);
+                #pragma unroll
+                for(int j=0;j<8;++j)
+                    accum[r][o][j%CHAINS]=fmaf(unpack<BF>(xp[j]),unpack<BF>(wp[j]),accum[r][o][j%CHAINS]);
+            }
+        }
+    }
+    #pragma unroll
+    for(int r=0;r<ROWS;++r)
+        #pragma unroll
+        for(int o=0;o<OUTPUTS;++o) {
+            float sum=accum[r][o][0];
+            #pragma unroll
+            for(int c=1;c<CHAINS;++c)sum+=accum[r][o][c];
+            #pragma unroll
+            for(int d=LANES/2;d;d/=2)sum+=__shfl_down_sync(0xffffffff,sum,d,LANES);
+            if(lane==0 && n0+o<N)out[int64_t(r)*N+n0+o]=pack<BF>(sum);
+        }
+}
+
+#define WARP_GEMV_CONFIGS(X) \
+ X(38,32,1,1) X(39,32,1,2) X(40,32,2,1) X(41,32,2,2) \
+ X(42,16,1,1) X(43,16,1,2) X(44,16,2,1) X(45,16,2,2) \
+ X(46,8,1,1) X(47,8,1,2) X(48,8,2,1) X(49,8,2,2)
+
+template<bool BF,int LANES,int OUTPUTS,int CHAINS>
+void warp_gemv(torch::Tensor x,torch::Tensor w,torch::Tensor out) {
+    dim3 grid((w.size(0)+(128/LANES)*OUTPUTS-1)/((128/LANES)*OUTPUTS));
+    auto stream=at::cuda::getCurrentCUDAStream();
+    #define ROW_CASE(R) case R:decode_warp_gemv_kernel<BF,R,LANES,OUTPUTS,CHAINS><<<grid,128,0,stream>>>( \
+        (const unsigned short*)x.data_ptr(),(const unsigned short*)w.data_ptr(),(unsigned short*)out.data_ptr(),w.size(0),x.size(1));break;
+    switch(x.size(0)) {ROW_CASE(1) ROW_CASE(2) ROW_CASE(3) ROW_CASE(4)}
+    #undef ROW_CASE
+}
+
 #define MMA_CONFIGS(X) \
  X(0,64,8,32,4,2,1) X(1,64,8,64,4,2,1) X(2,64,8,64,4,3,1) \
  X(3,128,8,64,4,2,1) X(4,32,8,64,2,2,1) X(5,64,8,128,4,2,1) \
@@ -174,6 +232,9 @@ template<bool BF> void dispatch(torch::Tensor x,torch::Tensor w,torch::Tensor ou
         #define CASE(ID,BN,BM,BK,WARPS,ST,SPLIT) case ID:launch<BF,BN,BM,BK,WARPS,ST,SPLIT>(x,w,out);break;
         MMA_CONFIGS(CASE)
         #undef CASE
+        #define WARP_CASE(ID,LANES,OUTPUTS,CHAINS) case ID:warp_gemv<BF,LANES,OUTPUTS,CHAINS>(x,w,out);break;
+        WARP_GEMV_CONFIGS(WARP_CASE)
+        #undef WARP_CASE
         case 14:simt<BF,1,32>(x,w,out);break;case 15:simt<BF,1,16>(x,w,out);break;case 16:simt<BF,1,8>(x,w,out);break;
         case 17:simt<BF,4,32>(x,w,out);break;case 18:simt<BF,4,16>(x,w,out);break;case 19:simt<BF,4,8>(x,w,out);break;
         case 20:simt<BF,8,32>(x,w,out);break;case 21:simt<BF,8,16>(x,w,out);break;case 22:simt<BF,8,8>(x,w,out);break;
@@ -187,7 +248,8 @@ void decode_impl(torch::Tensor x,torch::Tensor w,torch::Tensor out,int64_t cfg,b
     TORCH_CHECK(x.dim()==2 && w.dim()==2 && out.dim()==2 && x.is_contiguous() && w.is_contiguous() && out.is_contiguous(),"contiguous matrices required");
     TORCH_CHECK(x.scalar_type()==w.scalar_type() && x.scalar_type()==out.scalar_type() && (x.scalar_type()==at::kHalf || x.scalar_type()==at::kBFloat16),"FP16/BF16 required");
     TORCH_CHECK(x.size(1)==w.size(1) && out.size(0)==x.size(0) && out.size(1)==w.size(0) && x.size(1)%8==0,"invalid shape");
-    TORCH_CHECK(x.size(0)<=32 && cfg>=0 && cfg<38,"small-M requires M<=32 and config 0..37");
+    TORCH_CHECK(x.size(0)<=32 && cfg>=0 && cfg<50,"small-M requires M<=32 and config 0..49");
+    TORCH_CHECK(cfg<38 || x.size(0)<=4,"warp GEMV requires M<=4");
     TORCH_CHECK(reinterpret_cast<uintptr_t>(x.data_ptr())%16==0 && reinterpret_cast<uintptr_t>(w.data_ptr())%16==0,"16-byte alignment required");
     TORCH_CHECK(!out.is_alias_of(x) && !out.is_alias_of(w),"output aliases inputs");
     const c10::cuda::CUDAGuard guard(x.device());

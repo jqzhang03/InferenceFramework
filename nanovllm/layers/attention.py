@@ -134,6 +134,52 @@ def _tl_dtype(dt: torch.dtype):
             torch.float32: tl.float32}[dt]
 
 
+@triton.jit
+def _tree_paged_kernel(q_ptr, k_ptr, v_ptr, cache_k, cache_v, tables, lengths,
+                       padded, flat, ancestors, out, scale,
+                       q_stride: tl.constexpr, k_stride: tl.constexpr, v_stride: tl.constexpr,
+                       width: tl.constexpr, table_width: tl.constexpr,
+                       heads: tl.constexpr, kv_heads: tl.constexpr, hd: tl.constexpr,
+                       page: tl.constexpr, tree_tile: tl.constexpr, prefix_tile: tl.constexpr):
+    row = tl.program_id(0)
+    head = tl.program_id(1)
+    kv_head = head // (heads // kv_heads)
+    pos = tl.load(flat + row)
+    seq = pos // width
+    length = tl.load(lengths + seq)
+    d = tl.arange(0, hd)
+    q = tl.load(q_ptr + row * q_stride + head * hd + d).to(tl.float32)
+    m = -float("inf")
+    total = 0.
+    acc = tl.zeros((hd,), tl.float32)
+    for start in range(0, length, prefix_tile):
+        t = start + tl.arange(0, prefix_tile)
+        block = tl.load(tables + seq * table_width + start // page)
+        slot = block * page + t % page
+        addr = (slot[:, None] * kv_heads + kv_head) * hd + d[None, :]
+        kk = tl.load(cache_k + addr, t[:, None] < length, 0).to(tl.float32)
+        vv = tl.load(cache_v + addr, t[:, None] < length, 0).to(tl.float32)
+        score = tl.where(t < length, tl.sum(kk * q[None, :], axis=1) * scale, -float("inf"))
+        new_m = tl.maximum(m, tl.max(score, axis=0))
+        p = tl.exp(score - new_m)
+        old = tl.exp(m - new_m)
+        total = total * old + tl.sum(p, axis=0)
+        acc = acc * old + tl.sum(p[:, None] * vv, axis=0)
+        m = new_m
+    t = tl.arange(0, tree_tile)
+    valid = tl.load(ancestors + pos * width + t, t < width, False)
+    fresh_row = tl.load(padded + seq * width + t, t < width, 0)
+    addr = kv_head * hd + d[None, :]
+    kk = tl.load(k_ptr + fresh_row[:, None] * k_stride + addr, valid[:, None], 0).to(tl.float32)
+    vv = tl.load(v_ptr + fresh_row[:, None] * v_stride + addr, valid[:, None], 0).to(tl.float32)
+    score = tl.where(valid, tl.sum(kk * q[None, :], axis=1) * scale, -float("inf"))
+    new_m = tl.maximum(m, tl.max(score, axis=0))
+    p = tl.exp(score - new_m)
+    old = tl.exp(m - new_m)
+    out_row = (acc * old + tl.sum(p[:, None] * vv, axis=0)) / (total * old + tl.sum(p, axis=0))
+    tl.store(out + (row * heads + head) * hd + d, out_row)
+
+
 # ---------------------------------------------------------------------------
 # KV 行 gather（环 spec/verify 行装配）：按槽位索引拷贝行并（fp8 KV）按层
 # scale 反量化。torch index_select 不支持 float8 → fp8 缓存走自研内核；
@@ -428,6 +474,8 @@ class Attention(nn.Module):
             else:
                 kq, vq = k, v
             store_kvcache(kq, vq, k_cache, v_cache, sm)
+        if context.tree_attention is not None:
+            return self._tree_rows(q, k, v, context)
         # 环 spec/verify 行（滚动 MHA 模型 + 投机）：行 key 集 = 环内现存行
         # [kv_j0·B, end)（含本步刚写行）装配成稠密 K/V 喂 varlen——flash 分页
         # 无法表达环表（表项≠逻辑块号），见 _ring_varlen。
@@ -502,6 +550,31 @@ class Attention(nn.Module):
         else:    # decode
             o = self._decode_rows(q, context)
         return o
+
+    def _tree_rows(self, q: torch.Tensor, k: torch.Tensor,
+                   v: torch.Tensor, context) -> torch.Tensor:
+        batch = context.tree_attention
+        n_pre = batch.prefill_tokens
+        q_tree, k_tree, v_tree = q[n_pre:], k[n_pre:], v[n_pre:]
+        out_tree = torch.empty(q_tree.shape, device=q.device, dtype=q.dtype)
+        width = batch.padded_rows.size(1)
+        _tree_paged_kernel[(len(q_tree), self.num_heads)](
+            q_tree, k_tree, v_tree, self.k_cache, self.v_cache,
+            batch.block_tables, batch.prefix_lengths, batch.padded_rows, batch.flat_rows,
+            batch.ancestor_mask, out_tree, self.scale, q_tree.stride(0), k_tree.stride(0),
+            v_tree.stride(0), width, batch.block_tables.size(1), self.num_heads,
+            self.num_kv_heads, self.head_dim, self.k_cache.size(1),
+            triton.next_power_of_2(width), 32, num_warps=4)
+        if not n_pre:
+            return out_tree
+        rows = batch.prefill_rows
+        out_prefill = flash_attn_varlen_func(
+            q[:n_pre], self.k_cache, self.v_cache,
+            cu_seqlens_q=context.cu_seqlens_q[:rows + 1],
+            cu_seqlens_k=context.cu_seqlens_k[:rows + 1],
+            max_seqlen_q=context.max_seqlen_q, max_seqlen_k=context.max_seqlen_k,
+            block_table=context.block_tables[:rows], softmax_scale=self.scale, causal=True)
+        return torch.cat((out_prefill, out_tree), dim=0)
 
     def _ring_varlen(self, q: torch.Tensor) -> torch.Tensor:
         """环 spec/verify 行：行 key 集 = 环内现存行 [kv_j0·B, end)（含本步刚

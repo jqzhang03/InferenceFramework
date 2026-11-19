@@ -86,16 +86,19 @@ class ModelRunner:
             heads.to(device="cuda", dtype=hf_config.dtype)
             self.medusa_heads = heads
         # EAGLE草稿层（无RoPE transformer层 + 目标模型共享LM head，自回归草稿）
-        if config.speculative == "eagle":
+        if config.speculative in ("eagle", "eagle2"):
             from nanovllm.layers.eagle import EagleLayer
             head_dim = (getattr(hf_config, "head_dim", None)
                         or hf_config.hidden_size // hf_config.num_attention_heads)
             self.eagle_layer = EagleLayer(hf_config.hidden_size, hf_config.num_attention_heads,
                                           head_dim, hf_config.intermediate_size,
                                           hf_config.rms_norm_eps)
-            state = torch.load(config.eagle_path, map_location="cpu")
+            state = torch.load(config.eagle_path, map_location="cpu", weights_only=True)
             self.eagle_layer.load_state_dict(state)
             self.eagle_layer.to(device="cuda", dtype=hf_config.dtype)
+        if config.speculative == "eagle3":
+            from nanovllm.layers.eagle3 import Eagle3Layer
+            self.eagle_layer = Eagle3Layer.load(config.eagle_path).to(device="cuda", dtype=hf_config.dtype)
         # W8A8权重量化（SmoothQuant式：校准激活通道分布→折叠进权重→per-channel int8 + Triton int8 GEMM）
         # 放在sampler之后：校准用的run()会调用sampler。streaming 模式的量化已由
         # chunk_hook 在加载期完成，这里跳过。
@@ -116,6 +119,10 @@ class ModelRunner:
         from nanovllm.layers.cuda_linear import install_cuda_linears
         self.cuda_linear_count = install_cuda_linears(
             self.model, config.linear_backend, config.cuda_linear_tuning)
+        self.cuda_int4_count = 0
+        if config.int4_kernel_backend == "cuda":
+            from nanovllm.layers.cuda_int4 import install_cuda_int4
+            self.cuda_int4_count = install_cuda_int4(self.model, config.cuda_int4_expert_fusion)
         self._finalize_mla_mode()   # MLA 模型模式收尾（decode 内核 vs 稠密兜底）
         self._finalize_rolling()    # SWA 滚动缓冲（mistral 校验 + 层标记）
         self.warmup_model()
@@ -1129,6 +1136,57 @@ class ModelRunner:
                     full_prefill_block_tables=full_prefill_block_tables)
         return input_ids, positions
 
+    @staticmethod
+    def _spec_positions(seq: Sequence, start: int, count: int) -> list[int]:
+        if seq.draft_parents is None:
+            return list(range(start, start + count))
+        from nanovllm.engine.eagle_tree import tree_depths
+        return [start + depth for depth in tree_depths(seq.draft_parents)]
+
+    def _prepare_tree_attention(self, seqs: list[Sequence], prefill_rows: int,
+                                prefill_tokens: int) -> None:
+        seqs = seqs[prefill_rows:]
+        if not any(seq.draft_parents is not None for seq in seqs):
+            return
+        from nanovllm.engine.eagle_tree import TreeAttentionBatch, tree_mask
+        context = get_context()
+        width = max(seq.num_scheduled_tokens for seq in seqs)
+        padded, flat, masks = [], [], []
+        offset = 0
+        for batch_row, seq in enumerate(seqs):
+            n = seq.num_scheduled_tokens
+            parents = seq.draft_parents if seq.draft_parents is not None else list(range(n - 1))
+            padded.append([*range(offset, offset + n), *([offset] * (width - n))])
+            flat.extend(range(batch_row * width, batch_row * width + n))
+            mask = [row + [False] * (width - n) for row in tree_mask(parents)]
+            mask.extend([[True] + [False] * (width - 1)] * (width - n))
+            masks.append(mask)
+            offset += n
+
+        def device_tensor(values: list, dtype: torch.dtype) -> torch.Tensor:
+            return torch.tensor(values, dtype=dtype, pin_memory=True).cuda(non_blocking=True)
+
+        context.tree_attention = TreeAttentionBatch(
+            device_tensor(padded, torch.long), device_tensor(flat, torch.long),
+            device_tensor(masks, torch.bool),
+            device_tensor([len(seq) - 1 for seq in seqs], torch.int32),
+            context.block_tables[prefill_rows:], prefill_rows, prefill_tokens)
+
+    def compact_tree_kv(self, moves: list[tuple[Sequence, list[int]]]) -> None:
+        source, destination = [], []
+        for seq, path in moves:
+            start = len(seq) - 1
+            slots = self._span_slots(seq.block_table, start, start + seq.num_scheduled_tokens)
+            for dst, node in enumerate(path):
+                if node != dst:
+                    source.append(slots[node])
+                    destination.append(slots[dst])
+        if source:
+            cache = self.kv_cache.flatten(2, 3)
+            src = torch.tensor(source, device=cache.device, dtype=torch.long)
+            dst = torch.tensor(destination, device=cache.device, dtype=torch.long)
+            cache.index_copy_(2, dst, cache.index_select(2, src))
+
     def prepare_spec(self, seqs: list[Sequence]):
         """纯verify步（投机）：每序列query = [末token, 草稿...]（γ+1个token，
         位置从 len-1 起），num_cached = len-1 —— 即"分块prefill + 前缀复用"：
@@ -1154,7 +1212,7 @@ class ModelRunner:
             ends.append(end)
             assert n == len(seq.draft_tokens) + 1
             input_ids.extend([seq.last_token] + list(seq.draft_tokens))
-            positions.extend(range(start, end))
+            positions.extend(self._spec_positions(seq, start, n))
             cu_seqlens_q.append(cu_seqlens_q[-1] + n)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)
             max_seqlen_q = max(n, max_seqlen_q)
@@ -1192,6 +1250,7 @@ class ModelRunner:
                     is_spec=True,
                     mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
                     ring_starts=ring_starts, ring_idx=ring_idx)
+        self._prepare_tree_attention(seqs, 0, 0)
         return input_ids, positions
 
     def _prepare_mixed_spec(self, seqs: list[Sequence]):
@@ -1223,7 +1282,7 @@ class ModelRunner:
             end = start + n
             ends.append(end)
             input_ids.extend(tokens)
-            positions.extend(range(start, end))
+            positions.extend(range(start, end) if seq.is_prefill else self._spec_positions(seq, start, n))
             cu_seqlens_q.append(cu_seqlens_q[-1] + n)
             cu_seqlens_k.append(cu_seqlens_k[-1] + end)
             max_seqlen_q = max(n, max_seqlen_q)
@@ -1269,6 +1328,7 @@ class ModelRunner:
                     n_prefill_rows=n_prefill_rows,
                     mla_pre_starts=mla_pre_starts, mla_pre_idx=mla_pre_idx,
                     ring_starts=ring_starts, ring_idx=ring_idx)
+        self._prepare_tree_attention(seqs, n_prefill_rows, n_prefill_tokens)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -1327,6 +1387,9 @@ class ModelRunner:
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, kind: str,
                   return_hidden: bool = False):
+        if return_hidden and self.config.speculative == "eagle3":
+            hidden, features = self.model.model(input_ids, positions, capture_eagle3=True)
+            return self.model.compute_logits(hidden), features
         # 纯spec批次（verify）走spec CUDA graph：固定容量+零长度行填充，消除eager的
         # 逐kernel启动税（实测~10ms/步，见INTERVIEW.md §10.3.5）。按本步最大query长度
         # 选stride家族（低γ步用stride-3图，容量=3×行数，减少填充浪费）。
