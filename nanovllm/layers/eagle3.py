@@ -6,8 +6,10 @@ from pathlib import Path
 import torch
 from torch import nn
 from torch.nn import functional as F
+from flash_attn import flash_attn_with_kvcache
 from safetensors.torch import load_file
 
+from nanovllm.layers.attention import draft_tree_attention, store_kvcache
 from nanovllm.layers.eagle import _EagleRMSNorm
 
 
@@ -83,12 +85,51 @@ class Eagle3Layer(nn.Module):
         rotated = torch.cat((-b, a), dim=-1)
         return x * angles.cos().to(x.dtype) + rotated * angles.sin().to(x.dtype)
 
-    def forward(self, features: torch.Tensor, embeddings: torch.Tensor,
-                past: DraftKV | None) -> tuple[torch.Tensor, DraftKV]:
-        """Advance one or more consecutive positions, with a separate KV state per branch."""
+    def _inputs(self, features: torch.Tensor, embeddings: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if features.size(-1) == 3 * self.fc.out_features:
             features = self.fc(features)
-        qkv_input = torch.cat((self.input_layernorm(embeddings), self.hidden_norm(features)), dim=-1)
+        return features, torch.cat((self.input_layernorm(embeddings), self.hidden_norm(features)), dim=-1)
+
+    def _finish(self, features: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
+        hidden = features + self.o_proj(attention.flatten(-2))
+        normalized = self.post_attention_layernorm(hidden)
+        return hidden + self.down_proj(F.silu(self.gate_proj(normalized)) * self.up_proj(normalized))
+
+    def _rotate_rows(self, x: torch.Tensor, positions: torch.Tensor, heads: int) -> torch.Tensor:
+        return self._rotate(x.view(-1, heads, self.head_dim).transpose(0, 1), positions).transpose(0, 1).contiguous()
+
+    def commit(self, features: torch.Tensor, embeddings: torch.Tensor, positions: torch.Tensor,
+               slots: torch.Tensor, root_rows: torch.Tensor, tables: torch.Tensor,
+               lengths: torch.Tensor, cache: DraftKV) -> torch.Tensor | None:
+        """Project only accepted context rows and compute the next batched root."""
+        features, inputs = self._inputs(features, embeddings)
+        key = self._rotate_rows(self.k_proj(inputs), positions, self.kv_heads)
+        value = self.v_proj(inputs).view(-1, self.kv_heads, self.head_dim)
+        store_kvcache(key, value, *cache, slots)
+        if not root_rows.numel():
+            return None
+        q = self._rotate_rows(self.q_proj(inputs[root_rows]), positions[root_rows], self.heads)
+        out = flash_attn_with_kvcache(q[:, None], *cache, cache_seqlens=lengths,
+                                     block_table=tables, causal=False)
+        return self._finish(features[root_rows], out[:, 0])
+
+    def branch(self, features: torch.Tensor, embeddings: torch.Tensor, positions: torch.Tensor,
+               paths: torch.Tensor, scratch: DraftKV, level: int, tables: torch.Tensor,
+               lengths: torch.Tensor, cache: DraftKV) -> torch.Tensor:
+        """Project each new node once and read prefix/ancestor KV by index."""
+        features, inputs = self._inputs(features, embeddings)
+        q = self._rotate_rows(self.q_proj(inputs), positions, self.heads)
+        k, v = scratch
+        k[level].copy_(self._rotate_rows(self.k_proj(inputs), positions, self.kv_heads))
+        v[level].copy_(self.v_proj(inputs).view(-1, self.kv_heads, self.head_dim))
+        out = draft_tree_attention(q, k.flatten(0, 1), v.flatten(0, 1),
+                                   cache, tables, lengths, paths)
+        return self._finish(features, out)
+
+    def forward(self, features: torch.Tensor, embeddings: torch.Tensor,
+                past: DraftKV | None) -> tuple[torch.Tensor, DraftKV]:
+        """Dense consecutive-position reference for checkpoint and KV parity."""
+        features, qkv_input = self._inputs(features, embeddings)
         b, n, _ = features.shape
         start = 0 if past is None else past[0].size(2)
         positions = torch.arange(start, start + n, device=features.device)
@@ -104,10 +145,7 @@ class Eagle3Layer(nn.Module):
         causal = positions[:, None] >= torch.arange(start + n, device=q.device) if start and n > 1 else None
         out = F.scaled_dot_product_attention(q, k, v, attn_mask=causal,
                                              is_causal=not start and n > 1, enable_gqa=True)
-        hidden = features + self.o_proj(out.transpose(1, 2).flatten(2))
-        normalized = self.post_attention_layernorm(hidden)
-        hidden = hidden + self.down_proj(F.silu(self.gate_proj(normalized)) * self.up_proj(normalized))
-        return hidden, (k, v)
+        return self._finish(features, out.transpose(1, 2)), (k, v)
 
     def logits(self, features: torch.Tensor) -> torch.Tensor:
         return self.lm_head(self.norm(features))

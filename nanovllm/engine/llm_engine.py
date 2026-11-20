@@ -123,6 +123,8 @@ class LLMEngine:
         self._last_step_decode_iterations = 0
         self._last_step_multistep_tokens = 0
         self._last_step_decode_burst_yielded = False
+        self._eagle_acceptance: dict[int, float] = {}
+        self._eagle_policy_rounds: dict[int, int] = {}
         self._decode_burst_yield_signal = threading.Event()
         self._decode_burst_yield_callback: Callable[[], bool] | None = None
         atexit.register(self.exit)
@@ -135,7 +137,8 @@ class LLMEngine:
                     decode_bursts=0, decode_burst_rounds=0, decode_burst_yields=0,
                     decode_burst_skipped_slots=0, decode_burst_pressure_yields=0,
                     spec_steps=0, spec_rows=0,
-                    spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0)
+                    spec_verify_tokens=0, spec_draft_tokens=0, spec_accepted_drafts=0,
+                    eagle_wide_rounds=0, eagle_narrow_rounds=0, eagle_decode_rounds=0)
 
     def _record_once(self, seq: Sequence) -> None:
         """Append this sequence's timing snapshot exactly once.
@@ -178,6 +181,8 @@ class LLMEngine:
         self._req_metrics = []
         self._recorded_seq_ids = set()
         self._step_stats = self._empty_step_stats()
+        self._eagle_acceptance.clear()
+        self._eagle_policy_rounds.clear()
         for scheduler in ((self.prefill_scheduler, self.decode_scheduler) if self._pd
                           else (self.scheduler,)):
             scheduler.reset_metrics()
@@ -397,7 +402,8 @@ class LLMEngine:
 
     @torch.inference_mode()
     def _eagle_drafts(self, seqs: list[Sequence], hidden: torch.Tensor,
-                      n_acc_list: list[int], n_rows_list: list[int], prefill_tokens: int = 0):
+                      n_acc_list: list[int], n_rows_list: list[int], prefill_tokens: int = 0,
+                      paths: dict[int, list[int]] | None = None):
         """EAGLE-1 草稿：从验收后新 t_last 的 hidden 自回归生成 γ 个草稿 token。
 
         F(h_t, e(w_{t+1})) → h̃_{t+1} → LM_head → argmax 采样 w_{t+2}；下一步
@@ -418,32 +424,44 @@ class LLMEngine:
             if n_acc == 0:
                 continue  # 非verify行（prefill行）
             if not seq.is_finished:
-                items.append((seq, row + n_acc - 1))
+                last_row = paths[seq.seq_id][-1] if paths is not None else n_acc - 1
+                items.append((seq, row + last_row))
             row += n_rows
         if not items:
             return
         embed = self.model_runner.model.model.embed_tokens
         lm_head = self.model_runner.model.lm_head
         if self.config.speculative == "eagle2":
-            from nanovllm.engine.eagle_tree import build_tree
+            from nanovllm.engine.eagle_tree import build_batched_trees
+
+            depth, width, budget = self._eagle_tree_settings(len(items))
+            active, root_rows, roots, limits = [], [], [], []
             for seq, idx in items:
-                depth, budget = self._eagle_tree_budget(seq)
-                if not budget:
-                    seq.draft_tokens, seq.draft_parents = [], []
-                    continue
-                root_token = torch.tensor([seq.last_token], device=hidden.device)
-                h = layer(hidden[idx:idx + 1], embed(root_token))
-                states = {0: h[0]}
+                seq.draft_tokens, seq.draft_parents = [], None
+                limit = self._eagle_tree_budget(seq, depth, budget)
+                if all(limit):
+                    active.append(seq)
+                    root_rows.append(idx)
+                    roots.append(seq.last_token)
+                    limits.append(limit)
+            if not active:
+                return
+            rows, tokens = torch.tensor([root_rows, roots], device=hidden.device).unbind()
+            h = layer(hidden[rows], embed(tokens))
+            frontier = h[:, None]
+            batch = torch.arange(len(active), device=h.device)[:, None]
 
-                def advance(nodes: list[int], parents: list[int], tokens: list[int]) -> torch.Tensor:
-                    h_next = layer(torch.stack([states[i] for i in parents]),
-                                   embed(torch.tensor(tokens, device=hidden.device)))
-                    states.update(zip(nodes, h_next.unbind()))
-                    return F.linear(h_next, lm_head.weight)
+            def advance(tokens, parents, _level):
+                nonlocal frontier
+                next_hidden = layer(frontier[batch, parents].flatten(0, 1), embed(tokens.flatten()))
+                frontier = next_hidden.view(len(active), -1, h.size(-1))
+                return F.linear(frontier, lm_head.weight)
 
-                seq.draft_tokens, seq.draft_parents = build_tree(
-                    F.linear(h, lm_head.weight), advance, None, self.config.eagle_tree_top_k,
-                    depth, budget, eos)
+            proposals = build_batched_trees(F.linear(h, lm_head.weight), advance,
+                                             None, width, limits, eos)
+            for seq, (tokens, parents) in zip(active, proposals):
+                seq.draft_tokens = tokens
+                seq.draft_parents = parents if width > 1 and tokens else None
             return
         h = torch.stack([hidden[i] for _, i in items])            # [m, H]
         w = torch.tensor([s.last_token for s, _ in items], device=h.device)
@@ -473,50 +491,98 @@ class LLMEngine:
         for s, _ in items:
             s.draft_tokens = drafts[id(s)]
 
-    def _eagle_tree_budget(self, seq: Sequence) -> tuple[int, int]:
+    def _eagle_tree_settings(self, batch: int) -> tuple[int, int, int]:
+        config = self.config
+        limits = config.max_draft_len, config.eagle_tree_top_k, config.eagle_tree_max_nodes
+        if not batch or config.eagle_tree_policy == "fixed":
+            return limits
+        bucket = 1 if batch < 8 else 8 if batch < 32 else 32
+        recent = self._eagle_acceptance.get(bucket)
+        rounds = self._eagle_policy_rounds.get(bucket, 0)
+        self._eagle_policy_rounds[bucket] = rounds + 1
+        if recent is not None and bucket >= 8 and recent < .6 and rounds % 8:
+            self._step_stats["eagle_decode_rounds"] += 1
+            return 0, 1, 0
+        if recent is not None and bucket < 32 and recent >= 1.25:
+            self._step_stats["eagle_wide_rounds"] += 1
+            return limits
+        self._step_stats["eagle_narrow_rounds"] += 1
+        depth = min(limits[0], limits[2], 3 if bucket < 32 else 2)
+        return depth, 1, depth
+
+    def _eagle_tree_budget(self, seq: Sequence, depth: int, budget: int) -> tuple[int, int]:
         capacity = max(0, self.config.max_model_len - len(seq))
         remaining = max(0, seq.max_tokens - seq.num_completion_tokens - 1)
-        return (min(self.config.max_draft_len, capacity, remaining),
-                min(self.config.eagle_tree_max_nodes, capacity) if remaining else 0)
+        return min(depth, capacity, remaining), min(budget, capacity) if remaining else 0
 
     @torch.inference_mode()
     def _eagle3_drafts(self, spans: list[tuple[Sequence, int, int, bool, bool]],
                        features: torch.Tensor, paths: dict[int, list[int]]) -> None:
-        from nanovllm.engine.eagle_tree import build_tree
+        from nanovllm.engine.eagle_tree import build_batched_trees
 
-        layer = self.model_runner.eagle_layer
-        embed = self.model_runner.model.model.embed_tokens
+        runner = self.model_runner
+        layer, cache = runner.eagle_layer, runner.eagle3_cache
+        embed = runner.model.model.embed_tokens
+        ready = sum(not seq.is_finished and not partial for seq, _, _, _, partial in spans)
+        depth, width, budget = self._eagle_tree_settings(ready)
         offset = 0
+        selected, positions, slots, tokens = [], [], [], []
+        active, root_rows, prefix_lengths, limits = [], [], [], []
         for seq, start, count, prefill, partial_prefill in spans:
-            rows = features[offset:offset + count]
+            row_start = offset
             offset += count
             if seq.is_finished:
-                seq.eagle3_kv = None
                 continue
-            if not prefill:
-                rows = rows[paths[seq.seq_id]]
-            if not start:
-                seq.eagle3_kv = None
-            if start and (seq.eagle3_kv is None or seq.eagle3_kv[0].size(2) != start):
-                raise RuntimeError("EAGLE-3 draft KV lost alignment with the committed prefix")
-            tokens = torch.tensor(seq[start + 1:start + 1 + len(rows)], device=features.device)
-            h, seq.eagle3_kv = layer(rows.unsqueeze(0), embed(tokens).unsqueeze(0), seq.eagle3_kv)
+            path = range(count) if prefill else paths[seq.seq_id]
+            end = start + len(path)
+            selected.extend(row_start + i for i in path)
+            positions.extend(range(start, end))
+            slots.extend(runner._span_slots(seq.block_table, start, end))
+            tokens.extend(seq[start + 1:end + 1])
             if partial_prefill:
                 continue
-            depth, budget = self._eagle_tree_budget(seq)
-            states = {0: (h[:, -1:], seq.eagle3_kv)}
+            seq.draft_tokens, seq.draft_parents = [], None
+            limit = self._eagle_tree_budget(seq, depth, budget)
+            if all(limit):
+                active.append(seq)
+                root_rows.append(len(selected) - 1)
+                prefix_lengths.append(end)
+                limits.append(limit)
+        if not selected:
+            return
+        dev = features.device
+        rows, pos, slot, ids = torch.tensor([selected, positions, slots, tokens], device=dev).unbind()
+        tables = runner.prepare_block_tables(active) if active else slot
+        lengths = torch.tensor(prefix_lengths, dtype=torch.int32, device=dev)
+        h = layer.commit(features[rows], embed(ids), pos, slot,
+                         torch.tensor(root_rows, dtype=torch.long, device=dev),
+                         tables, lengths, cache)
+        if h is None:
+            return
+        batch = len(active)
+        levels = max(d for d, _ in limits) - 1
+        scratch = h.new_empty((2, levels, batch * width, layer.kv_heads, layer.head_dim)).unbind()
+        frontier = h[:, None]
+        ancestors = torch.full((batch, 1, levels), -1, device=dev, dtype=torch.int32)
+        request = torch.arange(batch, device=dev)[:, None]
+        scratch_rows = torch.arange(batch * width, device=dev, dtype=torch.int32).view(batch, width)
 
-            def advance(nodes: list[int], parents: list[int], tokens: list[int]) -> torch.Tensor:
-                previous = torch.cat([states[i][0] for i in parents], dim=0)
-                past = tuple(torch.cat([states[i][1][j] for i in parents], dim=0) for j in range(2))
-                out, kv = layer(previous, embed(torch.tensor(tokens, device=features.device))[:, None], past)
-                for index, node in enumerate(nodes):
-                    states[node] = (out[index:index + 1], tuple(k[index:index + 1] for k in kv))
-                return layer.logits(out[:, -1])
+        def advance(tokens, parents, level):
+            nonlocal frontier, ancestors
+            parent_hidden = frontier[request, parents].flatten(0, 1)
+            ancestors = ancestors[request, parents]
+            ancestors[..., level] = scratch_rows + level * batch * width
+            positions = (lengths[:, None] + level).expand(batch, width).reshape(-1)
+            out = layer.branch(parent_hidden, embed(tokens.flatten()), positions, ancestors,
+                               scratch, level, tables, lengths, cache)
+            frontier = out.view(batch, width, -1)
+            return layer.logits(frontier)
 
-            seq.draft_tokens, seq.draft_parents = build_tree(
-                layer.logits(h[:, -1]), advance, layer.target_ids, self.config.eagle_tree_top_k,
-                depth, budget, self.config.eos)
+        proposals = build_batched_trees(layer.logits(h), advance, layer.target_ids,
+                                         width, limits, self.config.eos)
+        for seq, (tokens, parents) in zip(active, proposals):
+            seq.draft_tokens = tokens
+            seq.draft_parents = parents if width > 1 and tokens else None
 
     @torch.inference_mode()
     def _dflash_drafts(self, spans: list[tuple[Sequence, int, int, bool, bool]],
@@ -842,7 +908,7 @@ class LLMEngine:
                 count = seq.num_scheduled_tokens
                 draft_spans.append((seq, start, count, seq.is_prefill,
                                     seq.is_prefill and start + count < len(seq)))
-        paths = {} if mode in ("eagle3", "dflash") else None
+        paths = {} if mode in ("eagle2", "eagle3", "dflash") else None
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
@@ -893,6 +959,8 @@ class LLMEngine:
         if has_spec:
             # 统计必须在postprocess_spec之前（之后draft_tokens/num_scheduled_tokens被清空）
             n_spec_rows = sum(1 for seq in seqs if seq.draft_tokens is not None)
+            proposed_rows = (sum(bool(seq.draft_tokens) for seq in seqs)
+                             if mode in ("eagle2", "eagle3") and self.config.eagle_tree_policy == "adaptive" else 0)
             # Medusa：postprocess前捕获每行行数（_medusa_drafts选hidden行用）
             n_rows_list = [seq.num_scheduled_tokens if seq.draft_tokens is not None else 0
                            for seq in seqs]
@@ -905,6 +973,11 @@ class LLMEngine:
             self._step_stats["spec_verify_tokens"] += n_verify
             self._step_stats["spec_draft_tokens"] += n_draft
             self._step_stats["spec_accepted_drafts"] += n_draft_acc
+            if proposed_rows:
+                bucket = 1 if n_spec_rows < 8 else 8 if n_spec_rows < 32 else 32
+                observed = n_draft_acc / proposed_rows
+                prior = self._eagle_acceptance.get(bucket, observed)
+                self._eagle_acceptance[bucket] = .75 * prior + .25 * observed
         else:
             self.scheduler.postprocess(seqs, token_ids)
         # Medusa/EAGLE：用本步verify的hidden生成下一轮草稿（写回seq.draft_tokens）
@@ -914,7 +987,7 @@ class LLMEngine:
             elif mode == "dflash":
                 self._dflash_drafts(draft_spans, hidden, paths)
             elif mode in ("eagle", "eagle2"):
-                self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list, scheduled_prefill_tokens)
+                self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list, scheduled_prefill_tokens, paths)
             else:
                 self._medusa_drafts(seqs, hidden, n_acc_list, n_rows_list)
         self._record_step_tokens(seqs, before)

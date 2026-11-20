@@ -173,6 +173,7 @@ class Scheduler:
         # ---- 投机解码（n-gram / Medusa） ----
         self.spec_decode = config.speculative in ("ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash")
         self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
+        self.eagle_tree_policy = getattr(config, "eagle_tree_policy", "fixed")
         self.ngram_window = config.ngram_window
         self.ngram_min_window = config.ngram_min_window
         self.max_draft_len = config.max_draft_len
@@ -757,6 +758,9 @@ class Scheduler:
         """纯verify步（无waiting）：所有running行做一次并行验证。"""
         rows = self._spec_rows(self.max_num_seqs, self.max_num_batched_tokens)
         assert rows
+        if (self.spec_mode in ("eagle2", "eagle3") and self.eagle_tree_policy == "adaptive"
+                and all(not seq.draft_tokens and len(seq.block_table) == seq.num_blocks for seq in rows)):
+            return rows, "decode"
         return rows, "spec"
 
     def _schedule_mixed_spec(self) -> tuple[list[Sequence], str]:
@@ -1021,7 +1025,6 @@ class Scheduler:
             seq.is_prefill = True
             seq.draft_tokens = None  # 回waiting的序列下次以prefill行重新调度，草稿作废
             seq.draft_parents = None
-            seq.eagle3_kv = None
             seq.swapped = False
             self.block_manager.deallocate(seq)
             if self.full_block_manager is not None and seq.kv_table:

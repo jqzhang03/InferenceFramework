@@ -893,12 +893,20 @@ class ModelRunner:
                 scratch if scratch < config.max_num_seqs
                 else (budget - scratch * draft_bytes) // both
             )
+        elif config.speculative == "eagle3":
+            eagle3_page = (2 * self.block_size * self.eagle_layer.kv_heads
+                           * self.eagle_layer.head_dim * itemsize)
+            config.num_kvcache_blocks = budget // (block_bytes + eagle3_page)
         else:
             config.num_kvcache_blocks = budget // block_bytes
         assert config.num_kvcache_blocks > 0
         if config.speculative == "dflash":
             self.dflash_cache = self.dflash.allocate_cache(config.num_kvcache_blocks, scratch, self.block_size)
         kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
+        if config.speculative == "eagle3":
+            self.eagle3_cache = torch.empty(
+                (2, config.num_kvcache_blocks, self.block_size,
+                 self.eagle_layer.kv_heads, self.eagle_layer.head_dim), dtype=kv_dtype).unbind(0)
         self.kv_cache = torch.empty(2, num_layers, config.num_kvcache_blocks,
                                     self.block_size, num_kv_heads, head_dim, dtype=kv_dtype)
         layer_id = 0

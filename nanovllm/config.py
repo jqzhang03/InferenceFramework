@@ -73,6 +73,7 @@ class Config:
     dflash_path: str = "" # local Qwen3-0.6B DFlash Speculators checkpoint directory
     eagle_tree_top_k: int = 2
     eagle_tree_max_nodes: int = 8 # candidate nodes, excluding the already emitted root token
+    eagle_tree_policy: str = "fixed" # fixed | adaptive (EAGLE-2/3)
     medusa_hidden: int = 256 # Medusa头隐藏维（输出层256×vocab是主要参数，控制总规模）
     prefix_cache_max_free_blocks: int = 0 # 空闲前缀缓存块上限；0表示不设上限，分配压力下按LRU回收
     mixed_cudagraph: bool = True # 普通混合Prefill/Decode批次使用按形状惰性捕获的CUDA Graph
@@ -191,6 +192,7 @@ class Config:
         if self.speculative in ("eagle2", "eagle3"):
             assert 1 <= self.eagle_tree_top_k <= 8 and 1 <= self.max_draft_len <= 8 \
                 and 1 <= self.eagle_tree_max_nodes <= 32, "invalid EAGLE tree budget"
+            assert self.eagle_tree_policy in ("fixed", "adaptive"), "invalid EAGLE tree policy"
         if self.int4_kernel_backend is None:
             self.int4_kernel_backend = self._default_int4_kernel_backend()
         if self.int4_kernel_backend == "cuda":

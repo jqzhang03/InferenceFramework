@@ -136,6 +136,7 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
               max_draft_len=args.max_draft_len,
               eagle_tree_top_k=args.eagle_tree_top_k,
               eagle_tree_max_nodes=args.eagle_tree_max_nodes,
+              eagle_tree_policy=args.eagle_tree_policy,
               enforce_eager=args.enforce_eager,
               kv_cache_dtype="fp8_e4m3" if args.fp8 else "auto",
               max_model_len=args.max_model_len,
@@ -296,6 +297,8 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
                 if stats["spec_verify_tokens"] else None),
             "phase_gpu_ms": {label: sum(a.elapsed_time(b) for a, b in events)
                              for label, events in phase_events.items()},
+            "eagle_policy_rounds": {mode: stats.get(f"eagle_{mode}_rounds", 0)
+                                    for mode in ("wide", "narrow", "decode")},
             "spec_verify_tokens": stats.get("spec_verify_tokens", 0),
             "spec_proposed_tokens": stats.get("spec_draft_tokens", 0),
             "spec_accepted_tokens": stats.get("spec_accepted_drafts", 0),
@@ -416,6 +419,7 @@ def main() -> None:
     parser.add_argument("--dflash-path", default="results/dflash_qwen3_0.6b/verified")
     parser.add_argument("--eagle-tree-top-k", type=int, default=2)
     parser.add_argument("--eagle-tree-max-nodes", type=int, default=8)
+    parser.add_argument("--eagle-tree-policy", choices=("fixed", "adaptive"), default="fixed")
     parser.add_argument("--enforce-eager", action="store_true")
     parser.add_argument("--cold-prefix", action="store_true", help="disable prefix cache sharing across all modes")
     parser.add_argument("--phase-timing", action="store_true", help="diagnostic CUDA events; run separately from wall-clock timing")
@@ -545,6 +549,8 @@ def main() -> None:
     }
     if "dflash" in spec_modes:
         expected_config["dflash_path"] = args.dflash_path
+    if args.eagle_tree_policy != "fixed":
+        expected_config["eagle_tree_policy"] = args.eagle_tree_policy
     completed_pair_keys = set()
     if args.resume:
         if not output_path.is_file():

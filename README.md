@@ -132,6 +132,11 @@ and `model.safetensors` from the supported Qwen3-0.6B draft checkpoint. Its draf
 KV is initialized during prefill, so it uses private target prefix blocks and
 recomputes preempted requests. Set `max_draft_len`, `eagle_tree_top_k`, and
 `eagle_tree_max_nodes` to control tree depth, frontier width, and draft node budget.
+EAGLE-2/3 expand draft frontiers across requests on the GPU. EAGLE-3 keeps one
+paged draft KV prefix per request and stores new branch rows in scratch space.
+Set `eagle_tree_policy="adaptive"` to adjust the budget with batch size and recent
+accepted draft length. It periodically probes a narrow tree after disabling
+speculation. The default `"fixed"` uses the configured limits.
 The paired EAGLE benchmark and reproduction commands are in the
 [Qwen3-0.6B EAGLE comparison](benchmarks/_eagle_comparison_20261119.md).
 

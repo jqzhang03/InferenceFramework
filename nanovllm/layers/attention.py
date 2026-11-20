@@ -140,11 +140,12 @@ def _tree_paged_kernel(q_ptr, k_ptr, v_ptr, cache_k, cache_v, tables, lengths,
                        q_stride: tl.constexpr, k_stride: tl.constexpr, v_stride: tl.constexpr,
                        width: tl.constexpr, table_width: tl.constexpr,
                        heads: tl.constexpr, kv_heads: tl.constexpr, hd: tl.constexpr,
-                       page: tl.constexpr, tree_tile: tl.constexpr, prefix_tile: tl.constexpr):
+                       page: tl.constexpr, tree_tile: tl.constexpr, prefix_tile: tl.constexpr,
+                       path_width: tl.constexpr = 0):
     row = tl.program_id(0)
     head = tl.program_id(1)
     kv_head = head // (heads // kv_heads)
-    pos = tl.load(flat + row)
+    pos = row if path_width else tl.load(flat + row)
     seq = pos // width
     length = tl.load(lengths + seq)
     d = tl.arange(0, hd)
@@ -167,8 +168,12 @@ def _tree_paged_kernel(q_ptr, k_ptr, v_ptr, cache_k, cache_v, tables, lengths,
         acc = acc * old + tl.sum(p[:, None] * vv, axis=0)
         m = new_m
     t = tl.arange(0, tree_tile)
-    valid = tl.load(ancestors + pos * width + t, t < width, False)
-    fresh_row = tl.load(padded + seq * width + t, t < width, 0)
+    if path_width:
+        fresh_row = tl.load(ancestors + row * path_width + t, t < path_width, -1)
+        valid = fresh_row >= 0
+    else:
+        valid = tl.load(ancestors + pos * width + t, t < width, False)
+        fresh_row = tl.load(padded + seq * width + t, t < width, 0)
     addr = kv_head * hd + d[None, :]
     kk = tl.load(k_ptr + fresh_row[:, None] * k_stride + addr, valid[:, None], 0).to(tl.float32)
     vv = tl.load(v_ptr + fresh_row[:, None] * v_stride + addr, valid[:, None], 0).to(tl.float32)
@@ -178,6 +183,21 @@ def _tree_paged_kernel(q_ptr, k_ptr, v_ptr, cache_k, cache_v, tables, lengths,
     old = tl.exp(m - new_m)
     out_row = (acc * old + tl.sum(p[:, None] * vv, axis=0)) / (total * old + tl.sum(p, axis=0))
     tl.store(out + (row * heads + head) * hd + d, out_row)
+
+
+def draft_tree_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                         cache: tuple[torch.Tensor, torch.Tensor], tables: torch.Tensor,
+                         lengths: torch.Tensor, paths: torch.Tensor) -> torch.Tensor:
+    """Read a shared paged prefix and the scratch slots on each draft path."""
+    batch, width, path_width = paths.shape
+    heads, hd = q.shape[1:]
+    out = torch.empty_like(q)
+    _tree_paged_kernel[(batch * width, heads)](
+        q, k, v, *cache, tables, lengths, paths, paths, paths, out, hd ** -.5,
+        q.stride(0), k.stride(0), v.stride(0), width, tables.size(1), heads,
+        cache[0].size(2), hd, cache[0].size(1), triton.next_power_of_2(path_width),
+        32, path_width=path_width, num_warps=4)
+    return out
 
 
 # ---------------------------------------------------------------------------

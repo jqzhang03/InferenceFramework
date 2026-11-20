@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from nanovllm.engine.eagle_tree import TreeAttentionBatch, build_tree, tree_depths, tree_mask, verify_tree
+from nanovllm.engine.eagle_tree import TreeAttentionBatch, build_batched_trees, build_tree, tree_depths, tree_mask, verify_tree
 
 
 def test_dynamic_tree_has_ancestor_closed_budget():
@@ -17,6 +17,29 @@ def test_dynamic_tree_has_ancestor_closed_budget():
     assert max(tree_depths(parents)) <= 3
     mask = tree_mask(parents)
     assert all(row[i] and row[0] and not any(row[i + 1:]) for i, row in enumerate(mask))
+
+
+@pytest.mark.parametrize("width", [1, 2, 3])
+def test_batched_trees_match_serial_with_mixed_limits(width):
+    generator = torch.Generator().manual_seed(19)
+    transitions = torch.randn(3, 7, 7, generator=generator)
+    roots = torch.randn(3, 7, generator=generator)
+    target_ids = torch.tensor([4, 6, 0, 1, 3, 5, 2])
+    limits = [(4, 5), (1, 2), (3, 0)]
+
+    def advance(tokens, _parents, _level):
+        return transitions[torch.arange(3)[:, None], tokens]
+
+    got = build_batched_trees(roots, advance, target_ids, width, limits, eos=6)
+    expected = []
+    for i, (depth, budget) in enumerate(limits):
+        def advance_serial(_nodes, _parents, tokens):
+            return transitions[i, tokens]
+
+        expected.append(build_tree(roots[i], advance_serial, target_ids, width, depth, budget, 6))
+    assert got == expected
+    for tokens, parents in got:
+        assert len(tokens) == len(tree_depths(parents)) - 1
 
 
 def test_tree_accepts_only_target_sampled_path():
@@ -44,6 +67,23 @@ def test_tree_sampling_preserves_target_paths():
         assert outcomes[a, b] == pytest.approx(distributions[0][a] * distributions[a + 1][b])
 
 
+def test_adaptive_budget_uses_batch_acceptance_and_reprobes():
+    from nanovllm.engine.llm_engine import LLMEngine
+
+    engine = SimpleNamespace(
+        config=SimpleNamespace(eagle_tree_policy="adaptive", max_draft_len=4,
+                               eagle_tree_top_k=2, eagle_tree_max_nodes=8),
+        _eagle_acceptance={1: 1.5, 8: 0.2, 32: 1.5},
+        _eagle_policy_rounds={8: 1},
+        _step_stats=LLMEngine._empty_step_stats(),
+    )
+    select = LLMEngine._eagle_tree_settings
+    assert select(engine, 1) == (4, 2, 8)
+    assert select(engine, 32) == (2, 1, 2)
+    assert all(select(engine, 8) == (0, 1, 0) for _ in range(7))
+    assert select(engine, 8) == (3, 1, 3)
+
+
 def test_eagle_uses_predecessor_hidden_after_first_rejection():
     from nanovllm.engine.llm_engine import LLMEngine
     from nanovllm.engine.sequence import Sequence
@@ -61,6 +101,26 @@ def test_eagle_uses_predecessor_hidden_after_first_rejection():
     hidden = torch.eye(3)
     LLMEngine._eagle_drafts(engine, [prefilling, rejected], hidden, [0, 1], [0, 2], prefill_tokens=1)
     assert rejected.draft_tokens == [1]
+
+
+def test_eagle2_seeds_draft_from_last_accepted_tree_row():
+    from nanovllm.engine.llm_engine import LLMEngine
+    from nanovllm.engine.sequence import Sequence
+    from nanovllm.sampling_params import SamplingParams
+
+    sequence = Sequence([0], SamplingParams(max_tokens=8))
+    sequence.append_tokens([2, 3])
+    model = SimpleNamespace(model=SimpleNamespace(embed_tokens=lambda x: x),
+                            lm_head=SimpleNamespace(weight=torch.eye(4)))
+    engine = SimpleNamespace(
+        model_runner=SimpleNamespace(model=model, eagle_layer=lambda h, _: h),
+        config=SimpleNamespace(max_draft_len=1, eos=99, speculative="eagle2"),
+        _eagle_tree_settings=lambda batch: (1, 1, 1),
+        _eagle_tree_budget=lambda seq, depth, budget: (depth, budget),
+    )
+    LLMEngine._eagle_drafts(engine, [sequence], torch.eye(4), [2], [3],
+                            prefill_tokens=1, paths={sequence.seq_id: [0, 2]})
+    assert sequence.draft_tokens == [3]
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
@@ -214,6 +274,37 @@ def test_public_eagle3_checkpoint_logits_and_incremental_cache():
     assert ((full_logits - expected_logits).norm() / expected_logits.norm()).item() < .009
     assert torch.equal(draft.target_ids[full_logits.argmax(-1)], draft.target_ids[expected_logits.argmax(-1)])
 
+    pages = features.new_full((2, 2, 256, draft.kv_heads, draft.head_dim), float("nan"))
+    cache = pages.unbind()
+    tables = torch.tensor([[1]], device=features.device, dtype=torch.int32)
+    lengths = torch.tensor([13], device=features.device, dtype=torch.int32)
+    root = draft.commit(features[0], embeddings[0], positions, positions + 256,
+                        positions[-1:], tables, lengths, cache)
+    def check_hidden(actual, dense):
+        # Single-query paged attention and dense SDPA round BF16 intermediates
+        # differently. Use a relative norm for the residual's near-zero elements.
+        error = (actual.float() - dense.float()).norm() / dense.float().norm()
+        assert error.item() < .012
+
+    check_hidden(root, whole[0, -1:])
+    committed = pages[:, 1, :13].clone()
+    for paged, dense in zip(committed, full_kv):
+        torch.testing.assert_close(paged, dense[0].transpose(0, 1), atol=.014, rtol=.015)
+    scratch = features.new_empty((2, 2, 2, draft.kv_heads, draft.head_dim)).unbind()
+    next_emb = embeddings[0, :2]
+    branch = draft.branch(root.expand(2, -1), next_emb, lengths.expand(2),
+                          torch.tensor([[[0, -1], [1, -1]]], device=features.device),
+                          scratch, 0, tables, lengths, cache)
+    reference, kv = draft(root.expand(2, -1)[:, None], next_emb[:, None],
+                          tuple(x.expand(2, -1, -1, -1) for x in full_kv))
+    check_hidden(branch, reference[:, 0])
+    branch2 = draft.branch(branch.flip(0), next_emb, lengths.expand(2) + 1,
+                           torch.tensor([[[1, 2], [0, 3]]], device=features.device),
+                           scratch, 1, tables, lengths, cache)
+    reference2, _ = draft(reference.flip(0), next_emb[:, None], tuple(x.flip(0) for x in kv))
+    check_hidden(branch2, reference2[:, 0])
+    torch.testing.assert_close(pages[:, 1, :13], committed, rtol=0, atol=0)
+
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
 def test_eagle3_chunked_prefill_and_mixed_verification():
@@ -238,10 +329,15 @@ def test_eagle3_chunked_prefill_and_mixed_verification():
         llm.add_request([1045, 295, 1947] * 100, params)
         llm.step()
         queued = llm.scheduler.waiting[0]
-        assert queued.eagle3_kv[0].size(2) == queued.num_cached_tokens < 300
+        cache = llm.model_runner.eagle3_cache
+        first_slots = llm.model_runner._span_slots(queued.block_table, 0, queued.num_cached_tokens)
+        first_keys = cache[0].flatten(0, 1)[first_slots].clone()
+        assert 0 < queued.num_cached_tokens < 300
+        assert torch.isfinite(first_keys).all()
         assert queued.draft_tokens is None
         llm.step()
-        assert llm.scheduler.running[0].eagle3_kv[0].size(2) == 300
+        assert llm.scheduler.running[0].num_cached_tokens == 300
+        torch.testing.assert_close(cache[0].flatten(0, 1)[first_slots], first_keys, rtol=0, atol=0)
         llm.add_request([1045, 295] * 8, params)
         assert llm.step()[1] == "mixed"
         for _ in range(18):
@@ -249,6 +345,6 @@ def test_eagle3_chunked_prefill_and_mixed_verification():
                 break
             llm.step()
         assert llm.is_finished()
-        assert queued.eagle3_kv is None
+        assert not queued.block_table
     finally:
         llm.exit()

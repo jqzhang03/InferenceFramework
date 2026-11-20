@@ -113,3 +113,53 @@ bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --speculative none
   --eagle-tree-top-k 1 --eagle-tree-max-nodes 4 --seeds 17 --phase-timing \
   --output results/eagle_narrow_phases_repro.json
 ```
+
+## EAGLE-2/3 批量建树与分页草稿 KV
+
+每个深度把所有活跃请求的前沿拼成一个草稿批次。候选 token、累计 log probability、父节点和最终保留集合都在 GPU 上确定。每轮结束才把树交给 CPU 调度器。单链直接用普通因果验证。EAGLE-2 使用验收路径的最后一个节点作为下一轮草稿输入。
+
+EAGLE-3 的草稿 KV 池复用目标块表的物理页编号，显存预算按目标和草稿每页合计计算。已提交的前缀 KV 只写一份，分支注意力通过索引读取前缀和祖先，每层新候选各写一行临时 KV。目标验证后，用接受路径上的目标特征追加正式草稿 KV。被抢占的请求从 prefill 重建草稿 KV。
+
+复用上一轮 ShareGPT held-out 的 B8/B32、seed 17/42/99、BF16、单卡、eager、greedy、固定 32 输出 token、50% 显存预算和 1024 上下文上限。宽树为深度 4、宽度 2、最多 8 个候选。窄树为深度 4、宽度 1、最多 4 个候选。各配置都独立配对无投机，原始数据包含端到端吞吐、TTFT、TPOT、目标前向次数、候选接受数、输出 token 和输入指纹。
+
+固定宽树的 EAGLE-2/3 在 ShareGPT B32 分别达到 916.4、1350.5 tok/s。原实现的同指纹数字分别为 207.7、180.5 tok/s。两次测量的无投机吞吐也有变化。EAGLE-2 同时修正了接受节点的索引，两轮差值包含这个行为变化。
+
+窄树的 B32 三种子中位有效验证行比例分别为 EAGLE-2 的 33.1%、EAGLE-3 的 38.8%，宽树为 21.0%、26.5%。EAGLE-2 在 B32 的请求级 greedy 一致数从宽树的 79/96 变为窄树的 96/96，EAGLE-3 从 79/96 变为 95/96。两种验证形状分别与各自同轮无投机做比较。 [宽树数据](../results/eagle_batched_20261119/wide.json) · [窄树数据](../results/eagle_batched_20261119/narrow_linear.json)
+
+| B | 配置 | 无投机 tok/s | EAGLE-2 tok/s | EAGLE-3 tok/s |
+| ---: | --- | ---: | ---: | ---: |
+| 8 | 宽树 | 171.0 | 294.0 (+59.1%) | 229.6 (+7.1%) |
+| 8 | 窄树，因果验证 | 551.1 | 460.2 (−8.1%) | 402.4 (−18.6%) |
+| 8 | 自适应 | 410.9 | 349.4 (−15.0%) | 323.2 (−21.3%) |
+| 32 | 宽树 | 2179.2 | 916.4 (−56.1%) | 1350.5 (−41.3%) |
+| 32 | 窄树，因果验证 | 1849.6 | 1256.5 (−32.1%) | 1548.0 (−22.4%) |
+| 32 | 自适应 | 1284.7 | 1923.8 (+6.2%) | 1512.1 (+17.7%) |
+
+吞吐列是三个种子的中位数，括号取同 seed 相对各行基线的变化中位数。B8 无投机基线跨配置有明显波动。B32 自适应各赢两组，EAGLE-2 的范围为 −5.9% 至 +57.8%，EAGLE-3 为 −50.9% 至 +45.6%。B32 自适应时 EAGLE-2/3 分别有 95/96、96/96 个请求与同轮无投机逐 token 一致。 [自适应数据](../results/eagle_batched_20261119/adaptive.json)
+
+`eagle_tree_policy="adaptive"` 按活跃请求数分到小于 8、8–31、至少 32 三档。默认探测窄树，最大深度分别为 3、3、2，受用户配置上限约束。每档更新近期每请求接受的草稿数，EWMA 当前样本权重为 0.25。至少 8 个活跃请求且平均接受不足 0.6 个草稿时，暂停该轮投机，每八轮探测一次。小于 32 个请求且平均接受至少 1.25 个草稿时，可用配置的宽树。B32 本轮测量中 EAGLE-2/3 分别有 17–24、24–25 次暂停草稿的决策。这些是实验阈值，API 默认仍使用 `"fixed"`。
+
+单独用 seed 17 采集宽树的 CUDA Event 区间。B8 的 EAGLE-2 草稿从 763.5 降至 196.0 ms，EAGLE-3 从 807.8 降至 367.4 ms。B32 的 EAGLE-2 从 4436.9 降至 250.5 ms，EAGLE-3 从 3895.6 降至 499.7 ms。B32 的目标 spec/decode 加 mixed 前向区间为 EAGLE-2 的 830.9 ms、EAGLE-3 的 455.5 ms、无投机的 462.1 ms。此时 EAGLE-2 仍付出更多目标验证时间，EAGLE-3 的目标时间接近无投机且另有草稿成本。CUDA Event 区间可包含设备等待主机提交的时间。 [分段数据](../results/eagle_batched_20261119/wide_phases.json) · [上一轮分段数据](../results/eagle_comparison_20261118/phases.json)
+
+B32 seed 17 的自适应诊断在两种模式中均采到了普通 `target_decode` 前向。暂停建树时，EAGLE-3 仍要将接受的目标特征投影写入分页草稿 KV，供后续探测使用。这次诊断的草稿区间合计为 EAGLE-2 的 25.7 ms 和 EAGLE-3 的 504.2 ms，包含各自的提交与调度开销。 [自适应分段数据](../results/eagle_batched_20261119/adaptive_phases.json)
+
+RTX 5060 Ti 上的 EAGLE、DFlash、投机验收和默认后端回归共 63 项通过。批量树与串行参考比较了 EOS、不同深度和预算。EAGLE-3 的分页根节点与两层分支和稠密 BF16 参考的隐藏状态相对 L2 差异均低于 1.2%，且分支前向保持已提交前缀逐位相同。
+
+### 批量建树复现
+
+```bash
+trace=results/supplemental/sharegpt_heldout_chat_template_100_20261016.jsonl
+common=(--speculative none,eagle2,eagle3 --styles sharegpt --prompts-file "$trace"
+  --batch-sizes 8,32 --seeds 17,42,99 --sampling-mode greedy --cold-prefix
+  --max-draft-len 4 --max-output-len 32 --min-input-len 64 --max-input-len 192
+  --max-model-len 1024 --gpu-memory-utilization .5)
+bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --output results/eagle_wide_repro.json
+bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --eagle-tree-top-k 1 \
+  --eagle-tree-max-nodes 4 --output results/eagle_linear_repro.json
+bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --eagle-tree-policy adaptive \
+  --output results/eagle_adaptive_repro.json
+bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --seeds 17 --phase-timing \
+  --output results/eagle_batched_phases_repro.json
+bash benchmarks/run_qwen_cuda.sh --eagle-study "${common[@]}" --batch-sizes 32 --seeds 17 \
+  --eagle-tree-policy adaptive --phase-timing --output results/eagle_adaptive_phases_repro.json
+```
