@@ -637,6 +637,8 @@ class LLMEngine:
                                pin_memory=True).cuda(non_blocking=True)
             proposals = draft(ids[0], ids[1], block_table, cache,
                               max(depth for _, depth in active)).tolist()
+            if self.config.speculative == "dspark":
+                proposals = draft.select_prefixes(proposals, [depth for _, depth in active], self.config.eos)
             for (seq, depth), row in zip(active, proposals):
                 row = row[:depth]
                 if self.config.eos in row:
@@ -899,16 +901,16 @@ class LLMEngine:
         has_spec = any(seq.draft_tokens is not None for seq in seqs)
         # Medusa/EAGLE模式：spec步需要最后一层hidden（下轮草稿输入）
         mode = self.config.speculative
-        return_hidden = (mode in ("eagle3", "dflash") or mode in ("eagle", "eagle2") and has_spec
+        return_hidden = (mode in ("eagle3", "dflash", "dspark") or mode in ("eagle", "eagle2") and has_spec
                          or mode == "medusa" and kind == "spec")
         draft_spans = []
-        if mode in ("eagle3", "dflash"):
+        if mode in ("eagle3", "dflash", "dspark"):
             for seq in seqs:
                 start = seq.num_cached_tokens if seq.is_prefill else len(seq) - 1
                 count = seq.num_scheduled_tokens
                 draft_spans.append((seq, start, count, seq.is_prefill,
                                     seq.is_prefill and start + count < len(seq)))
-        paths = {} if mode in ("eagle2", "eagle3", "dflash") else None
+        paths = {} if mode in ("eagle2", "eagle3", "dflash", "dspark") else None
         # 在运行模型之前执行COW复制：任何序列写共享部分块之前，先把旧块复制给写者。
         # 必须发生在 run() 之前，prepare_decode/prepare_prefill 才能基于换表后的新块计算slot
         for old_id, new_id in self.scheduler.cow_pairs:
@@ -984,7 +986,7 @@ class LLMEngine:
         if return_hidden:
             if mode == "eagle3":
                 self._eagle3_drafts(draft_spans, hidden, paths)
-            elif mode == "dflash":
+            elif mode in ("dflash", "dspark"):
                 self._dflash_drafts(draft_spans, hidden, paths)
             elif mode in ("eagle", "eagle2"):
                 self._eagle_drafts(seqs, hidden, n_acc_list, n_rows_list, scheduled_prefill_tokens, paths)

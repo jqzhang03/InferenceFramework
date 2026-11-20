@@ -47,8 +47,10 @@ class DFlashCache:
 
 
 class DFlashDecoderLayer(nn.Module):
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, *, causal: bool = False, window_size: tuple[int, int] = (-1, -1)):
         super().__init__()
+        self.causal = causal
+        self.window_size = window_size
         hidden = config["hidden_size"]
         intermediate = config["intermediate_size"]
         self.num_heads = config["num_attention_heads"]
@@ -79,13 +81,24 @@ class DFlashDecoderLayer(nn.Module):
             q.view(batch, -1, self.num_heads, self.head_dim), k_cache, v_cache,
             k.view(batch, -1, self.num_kv_heads, self.head_dim),
             v.view(batch, -1, self.num_kv_heads, self.head_dim),
-            cache_seqlens=lengths, block_table=block_table, causal=False,
+            cache_seqlens=lengths, block_table=block_table, causal=self.causal,
+            window_size=self.window_size,
         )
         hidden = hidden + self.o_proj(output.reshape(-1, self.q_width))
         return hidden + self.down(_draft_swiglu(self.gate_up(self.post_attention_layernorm(hidden))))
 
 
 class DFlashDraft(nn.Module):
+    architecture = "DFlashDraftModel"
+
+    @staticmethod
+    def _attention_settings(config: dict, layer_type: str) -> tuple[bool, tuple[int, int]]:
+        arch = config["transformer_layer_config"]
+        if (layer_type != "full_attention" or arch.get("is_causal") or arch.get("sliding_window")
+                or config.get("sample_from_anchor") or config.get("shift_label")):
+            raise ValueError("unsupported Qwen3-0.6B DFlash attention configuration")
+        return False, (-1, -1)
+
     def __init__(self, config: dict, model_len: int, draft_len: int):
         super().__init__()
         arch = config["transformer_layer_config"]
@@ -97,26 +110,30 @@ class DFlashDraft(nn.Module):
         self.kv_width = self.num_kv_heads * self.head_dim
         hidden = arch["hidden_size"]
         vocab = arch["vocab_size"]
-        draft_vocab = config.get("draft_vocab_size", vocab)
-        if not 1 <= draft_len < self.block_size:
-            raise ValueError(f"DFlash max_draft_len must be in [1, {self.block_size - 1}]")
-        if (config["architectures"] != ["DFlashDraftModel"]
+        draft_vocab = config.get("draft_vocab_size")
+        if draft_vocab is None:
+            draft_vocab = vocab
+        self.first_draft_slot = 0 if config.get("sample_from_anchor", config.get("shift_label")) else 1
+        max_draft_len = self.block_size - self.first_draft_slot
+        if not 1 <= draft_len <= max_draft_len:
+            raise ValueError(f"{self.architecture} max_draft_len must be in [1, {max_draft_len}]")
+        layer_count = arch["num_hidden_layers"]
+        layer_types = arch.get("layer_types") or ["full_attention"] * layer_count
+        if (config["architectures"] != [self.architecture]
                 or config["speculators_config"]["verifier"]["name_or_path"] != "Qwen/Qwen3-0.6B"
-                or self.block_size > 256 or arch["num_hidden_layers"] < 1
-                or self.block_size > 256 or arch["num_hidden_layers"] < 1
+                or self.block_size > 256 or layer_count < 1 or len(layer_types) != layer_count
                 or self.target_layers != tuple(sorted(set(self.target_layers)))
                 or not self.target_layers or not all(1 <= i <= 27 for i in self.target_layers)
                 or arch["model_type"] != "qwen3" or hidden != 1024 or vocab != 151936
                 or arch["hidden_act"] != "silu" or arch.get("attention_bias")
-                or arch.get("is_causal") or arch.get("sliding_window")
-                or any(t != "full_attention" for t in arch.get("layer_types", []))
                 or arch["rope_parameters"].get("rope_type") != "default"
                 or config.get("pure_draft_prefix_len", 0) != 0
-                or config.get("sample_from_anchor") or config.get("shift_label")
                 or not 0 <= self.mask_token_id < vocab or not 0 < draft_vocab <= vocab):
-            raise ValueError("unsupported Qwen3-0.6B DFlash Speculators checkpoint")
-        self.layers = nn.ModuleList(
-            DFlashDecoderLayer(arch) for _ in range(arch["num_hidden_layers"]))
+            raise ValueError(f"unsupported Qwen3-0.6B {self.architecture} Speculators checkpoint")
+        self.layers = nn.ModuleList()
+        for layer_type in layer_types:
+            causal, window_size = self._attention_settings(config, layer_type)
+            self.layers.append(DFlashDecoderLayer(arch, causal=causal, window_size=window_size))
         self.embed_tokens = nn.Embedding(vocab, hidden)
         self.fc = nn.Linear(len(self.target_layers) * hidden, hidden, bias=False)
         self.hidden_norm = DFlashRMSNorm(hidden, eps=arch["rms_norm_eps"])
@@ -128,12 +145,19 @@ class DFlashDraft(nn.Module):
                                     arch["rope_parameters"]["rope_theta"])
 
     @classmethod
-    def load(cls, path: str, model_len: int, draft_len: int) -> "DFlashDraft":
+    def load(cls, path: str, model_len: int, draft_len: int, *,
+             target_embedding: torch.Tensor | None = None,
+             target_lm_head: torch.Tensor | None = None) -> "DFlashDraft":
         directory = Path(path).expanduser()
         config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
         with torch.device("meta"):
             model = cls(config, model_len, draft_len)
         state = load_file(directory / "model.safetensors", device="cpu")
+        if "embed_tokens.weight" not in state and target_embedding is not None:
+            state["embed_tokens.weight"] = target_embedding.detach()
+        if ("lm_head.weight" not in state and target_lm_head is not None
+                and model.lm_head.out_features == model.embed_tokens.num_embeddings):
+            state["lm_head.weight"] = target_lm_head.detach()
         with torch.device("cpu"):
             model.rope.build_cache()
             target_ids = torch.arange(model.lm_head.out_features)
@@ -143,7 +167,7 @@ class DFlashDraft(nn.Module):
                 if (not torch.equal(target_ids, selected.nonzero().flatten())
                         or selected.numel() != model.embed_tokens.num_embeddings
                         or target_ids.numel() != model.lm_head.out_features):
-                    raise ValueError("invalid DFlash draft vocabulary mapping")
+                    raise ValueError("invalid block draft vocabulary mapping")
         state["target_ids"] = target_ids
         context_weights = []
         for i in range(len(model.layers)):
@@ -180,9 +204,8 @@ class DFlashDraft(nn.Module):
             k = apply_rotary_emb(layer.k_norm(k), *rope)
             store_kvcache(k, v, k_cache, v_cache, slots)
 
-    def forward(self, anchors: torch.Tensor, lengths: torch.Tensor,
-                block_table: torch.Tensor, cache: DFlashCache, draft_len: int) -> torch.Tensor:
-        """Propose a batch of continuations with one bidirectional draft pass."""
+    def _block_hidden(self, anchors: torch.Tensor, lengths: torch.Tensor, block_table: torch.Tensor,
+                      cache: DFlashCache, draft_len: int) -> torch.Tensor:
         offsets = torch.arange(self.block_size, device=anchors.device)
         positions = lengths[:, None] + offsets
         ids = anchors.new_full(positions.shape, self.mask_token_id)
@@ -192,5 +215,11 @@ class DFlashDraft(nn.Module):
         for layer, (k_cache, v_cache) in zip(self.layers, cache.tensors):
             hidden = layer(hidden, rope, k_cache, v_cache, block_table, lengths)
         # Keep the trained block width for attention; only project rows we can verify.
-        drafted = hidden.view(anchors.numel(), self.block_size, -1)[:, 1:1 + draft_len]
-        return self.target_ids[self.lm_head(self.norm(drafted)).argmax(dim=-1)]
+        start = self.first_draft_slot
+        return self.norm(hidden.view(anchors.numel(), self.block_size, -1)[:, start:start + draft_len])
+
+    def forward(self, anchors: torch.Tensor, lengths: torch.Tensor,
+                block_table: torch.Tensor, cache: DFlashCache, draft_len: int) -> torch.Tensor:
+        """Propose a batch of continuations with one bidirectional draft pass."""
+        hidden = self._block_hidden(anchors, lengths, block_table, cache, draft_len)
+        return self.target_ids[self.lm_head(hidden).argmax(dim=-1)]

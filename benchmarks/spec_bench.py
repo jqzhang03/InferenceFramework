@@ -133,6 +133,9 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
               eagle_path=(args.eagle3_path if speculative == "eagle3" else
                           args.eagle_path if speculative in ("eagle", "eagle2") else ""),
               dflash_path=args.dflash_path if speculative == "dflash" else "",
+              dspark_path=args.dspark_path if speculative == "dspark" else "",
+              dspark_confidence_threshold=args.dspark_confidence_threshold,
+              dspark_step_ms=args.dspark_step_ms,
               max_draft_len=args.max_draft_len,
               eagle_tree_top_k=args.eagle_tree_top_k,
               eagle_tree_max_nodes=args.eagle_tree_max_nodes,
@@ -220,7 +223,8 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
 
             measure(llm.model_runner, "run_model", lambda inputs: f"target_{inputs[2]}")
             draft_method = {"eagle": "_eagle_drafts", "eagle2": "_eagle_drafts",
-                            "eagle3": "_eagle3_drafts", "dflash": "_dflash_drafts"}.get(speculative)
+                            "eagle3": "_eagle3_drafts", "dflash": "_dflash_drafts",
+                            "dspark": "_dflash_drafts"}.get(speculative)
             if draft_method:
                 measure(llm, draft_method, "draft")
         started = time.perf_counter()
@@ -412,11 +416,16 @@ def main() -> None:
     parser.add_argument("--chat-template", action="store_true",
                         help="wrap prompt-file user text with the tokenizer chat template")
     parser.add_argument("--speculative", default="none,ngram",
-                        help="comma-separated modes: none,ngram,medusa,eagle,eagle2,eagle3,dflash")
+                        help="comma-separated modes: none,ngram,medusa,eagle,eagle2,eagle3,dflash,dspark")
     parser.add_argument("--medusa-path", default="results/medusa_heads.pt")
     parser.add_argument("--eagle-path", default="results/eagle_layer.pt")
     parser.add_argument("--eagle3-path", default="results/eagle3_qwen3_0.6b")
     parser.add_argument("--dflash-path", default="results/dflash_qwen3_0.6b/verified")
+    parser.add_argument("--dspark-path", default="results/dspark_qwen3_0.6b/verified")
+    parser.add_argument("--dspark-confidence-threshold", type=float, default=0.3,
+                        help="minimum prefix survival without a measured verifier cost curve")
+    parser.add_argument("--dspark-step-costs", type=Path,
+                        help="JSON file with step_ms for 1, 2, ... target verification rows")
     parser.add_argument("--eagle-tree-top-k", type=int, default=2)
     parser.add_argument("--eagle-tree-max-nodes", type=int, default=8)
     parser.add_argument("--eagle-tree-policy", choices=("fixed", "adaptive"), default="fixed")
@@ -466,7 +475,8 @@ def main() -> None:
     spec_modes = [item.strip() for item in args.speculative.split(",") if item.strip()]
     if not spec_modes or "none" not in spec_modes:
         raise ValueError("--speculative must include the none baseline")
-    if any(mode not in {"none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash"} for mode in spec_modes):
+    if any(mode not in {"none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash", "dspark"}
+           for mode in spec_modes):
         raise ValueError("unsupported speculative mode")
     if "medusa" in spec_modes and not os.path.isfile(args.medusa_path):
         raise FileNotFoundError(f"Medusa weights do not exist: {args.medusa_path}")
@@ -477,12 +487,20 @@ def main() -> None:
         for filename in ("config.json", "model.safetensors"):
             if not (Path(args.eagle3_path) / filename).is_file():
                 raise FileNotFoundError(Path(args.eagle3_path) / filename)
-    if "dflash" in spec_modes:
-        args.dflash_path = os.path.expanduser(args.dflash_path)
+    for mode in ("dflash", "dspark"):
+        if mode not in spec_modes:
+            continue
+        field = f"{mode}_path"
+        directory = os.path.expanduser(getattr(args, field))
+        setattr(args, field, directory)
         for filename in ("config.json", "model.safetensors"):
-            if not (Path(args.dflash_path) / filename).is_file():
-                raise FileNotFoundError(Path(args.dflash_path) / filename)
-    if {"eagle2", "eagle3", "dflash"}.intersection(spec_modes):
+            if not (Path(directory) / filename).is_file():
+                raise FileNotFoundError(Path(directory) / filename)
+    args.dspark_step_ms = ()
+    if args.dspark_step_costs is not None and "dspark" in spec_modes:
+        costs = json.loads(args.dspark_step_costs.read_text(encoding="utf-8"))
+        args.dspark_step_ms = tuple(float(value) for value in costs["step_ms"])
+    if {"eagle2", "eagle3", "dflash", "dspark"}.intersection(spec_modes):
         args.enforce_eager = True
     if args.chat_template and not args.prompts_file:
         raise ValueError("--chat-template requires --prompts-file")
@@ -549,6 +567,10 @@ def main() -> None:
     }
     if "dflash" in spec_modes:
         expected_config["dflash_path"] = args.dflash_path
+    if "dspark" in spec_modes:
+        expected_config.update(dspark_path=args.dspark_path,
+                               dspark_confidence_threshold=args.dspark_confidence_threshold,
+                               dspark_step_ms=list(args.dspark_step_ms))
     if args.eagle_tree_policy != "fixed":
         expected_config["eagle_tree_policy"] = args.eagle_tree_policy
     completed_pair_keys = set()

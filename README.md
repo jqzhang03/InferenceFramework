@@ -1,8 +1,4 @@
-<p align="center">
-<img width="300" src="assets/logo.png">
-</p>
-
-# Nano-vLLM
+# InferenceFramework
 
 **Default Qwen3-0.6B projections:** `LLM(model)` selects `linear_backend="cuda_decode"`
 for FP16/BF16 Qwen3-0.6B with TP=1 and no weight quantization or explicit PD mode.
@@ -83,41 +79,6 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 | Gemma-2 | `gemma2` | alternating local/global windows, attn + final logit soft-cap, embed ×√d, RMSNorm (1+w) |
 | DeepSeek-V2 | `deepseek_v2` | **MLA** (fused latent cache, absorbed-decode Triton kernel, 7.11× KV compression) + MoE with shared experts |
 
-## Installation
-
-```bash
-pip install -e .        # the only build step
-```
-
-Python 3.10–3.12 and an NVIDIA GPU are required. On Blackwell (sm_120) use a CUDA 12.8+ torch build (`torch==2.8.0`, cu128 wheels); install flash-attn from the Dao-AILab prebuilt-wheel releases matching your torch build (PyPI ships sdists only). Details and env gotchas: [`CLAUDE.md`](CLAUDE.md).
-
-Or install straight from the repository:
-
-```bash
-pip install git+https://github.com/jqzhang03/nano-vllm.git
-```
-
-## Model Download
-
-```bash
-huggingface-cli download Qwen/Qwen3-0.6B \
-  --local-dir ~/huggingface/Qwen3-0.6B/ \
-  --local-dir-use-symlinks False
-```
-
-## Quick Start
-
-The API mirrors vLLM's offline interface:
-
-```python
-from nanovllm import LLM, SamplingParams
-
-llm = LLM("/YOUR/MODEL/PATH", enforce_eager=True, tensor_parallel_size=1)
-sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
-prompts = ["Hello, Nano-vLLM."]
-outputs = llm.generate(prompts, sampling_params)
-outputs[0]["text"]
-```
 
 Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
 `nvfp4_backend="software|cublaslt"`,

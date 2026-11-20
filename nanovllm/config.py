@@ -71,6 +71,9 @@ class Config:
     medusa_path: str = "" # Medusa头权重文件（.pt，benchmarks/medusa_train.py训练产出）；speculative="medusa"时必须
     eagle_path: str = "" # local .pt for EAGLE-1/2, checkpoint directory for EAGLE-3
     dflash_path: str = "" # local Qwen3-0.6B DFlash Speculators checkpoint directory
+    dspark_path: str = "" # local Qwen3-0.6B DSpark Speculators checkpoint directory
+    dspark_confidence_threshold: float = 0.3 # prefix survival cutoff when step costs are unavailable
+    dspark_step_ms: tuple[float, ...] = () # measured verifier costs indexed by row count minus one
     eagle_tree_top_k: int = 2
     eagle_tree_max_nodes: int = 8 # candidate nodes, excluding the already emitted root token
     eagle_tree_policy: str = "fixed" # fixed | adaptive (EAGLE-2/3)
@@ -146,7 +149,7 @@ class Config:
                 "当前 PD 分离版本暂不支持 rolling_cache"
             assert self.kv_cache_dtype == "auto", \
                 "当前 PD KV 传输暂要求 kv_cache_dtype='auto'"
-        assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash"), \
+        assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash", "dspark"), \
             f"unknown speculative: {self.speculative}"
         assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "awq", "sparse24", "fp8"), \
             f"unknown quantization: {self.quantization}"
@@ -165,20 +168,22 @@ class Config:
             assert self.medusa_path, "speculative=medusa requires medusa_path"
         if self.speculative in ("eagle", "eagle2", "eagle3"):
             assert self.eagle_path, f"speculative={self.speculative} requires eagle_path"
-        if self.speculative == "dflash":
-            assert self.dflash_path, "speculative=dflash requires dflash_path"
-            self.dflash_path = os.path.expanduser(self.dflash_path)
+        if self.speculative in ("dflash", "dspark"):
+            path_field = f"{self.speculative}_path"
+            path = getattr(self, path_field)
+            assert path, f"speculative={self.speculative} requires {path_field}"
+            directory = os.path.expanduser(path)
+            setattr(self, path_field, directory)
             for filename in ("config.json", "model.safetensors"):
-                path = os.path.join(self.dflash_path, filename)
+                path = os.path.join(directory, filename)
                 if not os.path.isfile(path):
                     raise FileNotFoundError(path)
-            self.dflash_path = os.path.expanduser(self.dflash_path)
-            for filename in ("config.json", "model.safetensors"):
-                path = os.path.join(self.dflash_path, filename)
-                if not os.path.isfile(path):
-                    raise FileNotFoundError(path)
+        if self.speculative == "dspark":
+            assert 0 <= self.dspark_confidence_threshold <= 1, "invalid DSpark confidence threshold"
+            assert all(isfinite(value) and value > 0 for value in self.dspark_step_ms), \
+                "DSpark step costs must be finite and positive"
         self.hf_config = AutoConfig.from_pretrained(self.model)
-        if self.speculative in ("eagle2", "eagle3", "dflash"):
+        if self.speculative in ("eagle2", "eagle3", "dflash", "dspark"):
             hf = self.hf_config
             shape = tuple(getattr(hf, key, None) for key in (
                 "model_type", "hidden_size", "num_hidden_layers", "intermediate_size",

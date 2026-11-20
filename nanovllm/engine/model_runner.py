@@ -103,6 +103,15 @@ class ModelRunner:
             from nanovllm.layers.dflash import DFlashDraft
             self.dflash = DFlashDraft.load(config.dflash_path, config.max_model_len,
                                            config.max_draft_len).to(device="cuda", dtype=hf_config.dtype)
+        if config.speculative == "dspark":
+            from nanovllm.layers.dspark import DSparkDraft
+            self.dflash = DSparkDraft.load(
+                config.dspark_path, config.max_model_len, config.max_draft_len,
+                target_embedding=self.model.model.embed_tokens.weight,
+                target_lm_head=self.model.lm_head.weight,
+            ).to(device="cuda", dtype=hf_config.dtype)
+            self.dflash.confidence_threshold = config.dspark_confidence_threshold
+            self.dflash.step_ms = config.dspark_step_ms
         # W8A8权重量化（SmoothQuant式：校准激活通道分布→折叠进权重→per-channel int8 + Triton int8 GEMM）
         # 放在sampler之后：校准用的run()会调用sampler。streaming 模式的量化已由
         # chunk_hook 在加载期完成，这里跳过。
@@ -884,7 +893,7 @@ class ModelRunner:
         # 根据可用显存计算可分配的KV Cache块总数
         # 总显存x利用率-已使用显存-预热峰值+当前已分配了的显存 除以 单块大小
         budget = int(total * config.gpu_memory_utilization - used - peak + current)
-        if config.speculative == "dflash":
+        if config.speculative in ("dflash", "dspark"):
             draft_bytes = self.dflash.page_bytes(self.block_size, itemsize)
             # One tail scratch page per active drafter, at most one per live context page.
             both = block_bytes + draft_bytes
@@ -900,7 +909,7 @@ class ModelRunner:
         else:
             config.num_kvcache_blocks = budget // block_bytes
         assert config.num_kvcache_blocks > 0
-        if config.speculative == "dflash":
+        if config.speculative in ("dflash", "dspark"):
             self.dflash_cache = self.dflash.allocate_cache(config.num_kvcache_blocks, scratch, self.block_size)
         kv_dtype = torch.float8_e4m3fn if use_fp8 else hf_config.dtype
         if config.speculative == "eagle3":
@@ -1415,7 +1424,7 @@ class ModelRunner:
         if return_hidden and self.config.speculative == "eagle3":
             hidden, features = self.model.model(input_ids, positions, capture_eagle3=True)
             return self.model.compute_logits(hidden), features
-        if return_hidden and self.config.speculative == "dflash":
+        if return_hidden and self.config.speculative in ("dflash", "dspark"):
             hidden, features = self.model.model(input_ids, positions,
                                                 capture_layers=self.dflash.target_layers)
             return self.model.compute_logits(hidden), features

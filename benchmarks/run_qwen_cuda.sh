@@ -9,6 +9,10 @@ if [[ "${1:-}" == "--eagle-study" ]]; then
     shift
     exec python -m benchmarks.spec_bench "$@"
 fi
+if [[ "${1:-}" == "--dspark-cost" ]]; then
+    shift
+    exec python -m benchmarks.dspark_verifier_cost "$@"
+fi
 if [[ "${1:-}" == "--eagle-pytest" ]]; then
     exec python -m pytest tests/test_eagle_tree.py tests/test_spec_decode.py tests/test_linear_backend_default.py -q
 fi

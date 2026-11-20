@@ -93,7 +93,7 @@ class Scheduler:
             self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size,
                                               rolling_window=ring_window,
                                               ring_slack=config.max_draft_len + 2,
-                                              no_share=config.pd_separation or config.speculative in ("eagle3", "dflash"),
+                                              no_share=config.pd_separation or config.speculative in ("eagle3", "dflash", "dspark"),
                                               max_free_prefix_blocks=config.prefix_cache_max_free_blocks,
                                               prefix_feature_cache=config.prefix_feature_cache)
             self.full_block_manager = None
@@ -133,7 +133,7 @@ class Scheduler:
         # FP8 KV 在 CPU 侧按 uint8 原始字节保存并往返，避免 float8 的 CPU 算子限制。
         # TP>1 的 spawn 进程尚未实现每个 rank 的独立 offload buffer，因此仍回退 recompute。
         self.kv_swap = (config.kv_swap and config.tensor_parallel_size == 1
-                        and config.speculative not in ("eagle3", "dflash"))
+                        and config.speculative not in ("eagle3", "dflash", "dspark"))
         self._swap_max_bytes = int(config.kv_swap_space_gb * 1e9)
         self._swap_bytes = 0  # 当前换出缓冲累计字节（超预算回落 recompute）
         if self.kv_swap:
@@ -171,7 +171,7 @@ class Scheduler:
             # Retain the aggregate for callers that only need an upper-bound estimate.
             self._swap_bytes_per_block = sum(self._swap_pool_bytes_per_block.values())
         # ---- 投机解码（n-gram / Medusa） ----
-        self.spec_decode = config.speculative in ("ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash")
+        self.spec_decode = config.speculative in ("ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash", "dspark")
         self.spec_mode = config.speculative   # "ngram" | "medusa" | "eagle"
         self.eagle_tree_policy = getattr(config, "eagle_tree_policy", "fixed")
         self.ngram_window = config.ngram_window
@@ -569,7 +569,7 @@ class Scheduler:
                 return self._schedule_mixed()
             if self.waiting:
                 return self._schedule_prefill()
-            if self.spec_mode in ("eagle", "eagle2", "eagle3", "dflash") or any(seq.draft_tokens for seq in self.running):
+            if self.spec_mode in ("eagle", "eagle2", "eagle3", "dflash", "dspark") or any(seq.draft_tokens for seq in self.running):
                 return self._schedule_spec()
             for seq in self.running:
                 seq.draft_tokens = None
@@ -618,7 +618,7 @@ class Scheduler:
         上限 = min(最大草稿数, 剩余输出预算-1)：每步至少产出1个token（bonus/
         拒绝样本），所以草稿数最多 = remaining-1，保证追加后不超max_tokens。
         """
-        if self.spec_mode in ("medusa", "eagle", "eagle2", "eagle3", "dflash") and seq.draft_tokens is not None:
+        if self.spec_mode in ("medusa", "eagle", "eagle2", "eagle3", "dflash", "dspark") and seq.draft_tokens is not None:
             return  # engine已设置（GPU头前向/草稿层自回归），保持
         remaining = seq.max_tokens - seq.num_completion_tokens - 1
         max_len = min(self.max_draft_len, remaining)
