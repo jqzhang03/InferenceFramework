@@ -61,3 +61,5 @@ python3 -m benchmarks.deepseek_bottleneck_trace "$out/bottleneck.sqlite"
 ```
 
 [独立计时与数值核对原始数据](../profiles/deepseek_bottleneck_20261118/timing.json) · [Nsight Systems 时间线](../profiles/deepseek_bottleneck_20261118/bottleneck.nsys-rep) · [Nsight SQLite](../profiles/deepseek_bottleneck_20261118/bottleneck.sqlite)
+
+GPU 路由索引打包与 expert offset 的实现、四负载复测见 [_deepseek_compact_20261122.md](_deepseek_compact_20261122.md)。

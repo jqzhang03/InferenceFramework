@@ -91,7 +91,7 @@ class MoE(nn.Module):
         # 全尺寸最优或接近）；True = Triton 真段式内核（无 padding；实测仅在
         # 小 E + 极长段赢 43%，见 nanovllm/layers/moe_segment.py 头部边界表）
         self.segment_backend = segment_backend
-        if int4_backend not in ("loop", "segment"):
+        if int4_backend not in ("loop", "segment", "compact"):
             raise ValueError(f"unknown MoE INT4 backend: {int4_backend!r}")
         self.int4_backend = int4_backend
         self.fuse_int4_gate_up = fuse_int4_gate_up
@@ -157,6 +157,10 @@ class MoE(nn.Module):
         """自动后端：float 权重可组 → grouped 批量 GEMM；否则逐专家循环。"""
         if self._ensure_grouped_weights():
             return self._forward_grouped(x)
+        if self.int4_backend == "compact" and self._can_compact_int4(x):
+            compact = self._forward_compact_int4(x)
+            if compact is not None:
+                return compact
         if self.int4_backend == "segment" and self._can_segment_int4(x):
             return self._forward_segment_int4(x)
         return self._forward_loop(x)
@@ -210,6 +214,113 @@ class MoE(nn.Module):
         self._int4_segment_reason = reason
         self._int4_segment_ok = reason is None
         return self._int4_segment_ok
+
+    def _can_compact_int4(self, x: torch.Tensor) -> bool:
+        """The route-major CUDA path handles the decode row ranges it was built for.
+
+        The expert kernel is templated for at most eight activation rows per
+        expert, and every expert still gets a capped CTA fan-out. Larger prefill
+        chunks go through ``_forward_compact_host`` so they keep the existing MMA
+        expert kernels and bitwise reference outputs. In decode, an expert with
+        5-8 rows uses this GEMV path while the loop reference uses MMA; the
+        accumulator order is identical and the logits differ only at BF16
+        round-off (validated in benchmarks/deepseek_bottleneck.py).
+        """
+        if x.ndim != 2 or not x.is_contiguous() or not 0 < x.size(0) <= 4096:
+            return False
+        if not self._can_segment_int4(x):
+            return False
+        extension = getattr(self.experts[0].gate_proj, "_cuda_int4_ext", None)
+        return extension is not None and all(
+            getattr(linear, "_cuda_int4_ext", None) is extension
+            for expert in self.experts
+            for linear in (expert.gate_proj, expert.up_proj, expert.down_proj))
+
+    def _forward_compact_host(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-layer packing for larger chunks; one route read, exact expert kernels.
+
+        Prefill rows per expert exceed the decode template width. Keeping the
+        existing expert kernels here preserves the reference accumulator path
+        and its bitwise outputs; the route is still read once per layer, and the
+        GPU sort supplies the gather order so no index array is copied back.
+        """
+        T, k = x.size(0), self.top_k
+        probs, indices = self._route(x)
+        idx_flat = indices.reshape(-1)
+        expert_slots = [[] for _ in self.experts]
+        for slot, expert_id in enumerate(idx_flat.tolist()):
+            expert_slots[expert_id].append(slot)
+        target = torch.arange(T, device=x.device).repeat_interleave(k)
+        order = torch.argsort(idx_flat, stable=True)
+        target_sorted = target[order]
+        probs_sorted = probs.reshape(-1)[order]
+        packed = x.index_select(0, target_sorted)
+        out = torch.zeros_like(x)
+        start = 0
+        for expert, slots in zip(self.experts, expert_slots):
+            count = len(slots)
+            if not count:
+                continue
+            stop = start + count
+            ys = expert(packed[start:stop])
+            out.index_add_(0, target_sorted[start:stop],
+                           ys * probs_sorted[start:stop, None])
+            start = stop
+        return out
+
+    def _forward_compact_int4(self, x: torch.Tensor) -> torch.Tensor | None:
+        """Route-major decode dispatch; larger batches keep the reference kernels.
+
+        For up to eight token rows the router slots are sorted by expert id once,
+        ``counts``/``offsets`` stay on the device, and the CUDA extension launches
+        one grid per projection, so no route value crosses to the host. Bigger
+        chunks use ``_forward_compact_host`` because their per-expert row count
+        exceeds the decode template and the existing MMA expert path is bitwise.
+        """
+        T, k = x.size(0), self.top_k
+        if T > 8:
+            return self._forward_compact_host(x)
+        top_vals, top_idx = self._route(x)
+        idx_flat = top_idx.reshape(-1)
+        if idx_flat.numel() == 0:
+            return torch.zeros_like(x)
+        target = torch.arange(T, device=x.device).repeat_interleave(k)
+        order = torch.argsort(idx_flat, stable=True)
+        sorted_idx = idx_flat[order]
+        # bincount sizes its output from the input maximum and therefore syncs;
+        # index_add_ over a fixed-size histogram keeps the whole route pass on
+        # the device.
+        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
+        counts.index_add_(0, sorted_idx, torch.ones_like(sorted_idx, dtype=torch.int32))
+        offsets = torch.cumsum(counts, 0, dtype=torch.int32) - counts
+        packed = x.index_select(0, target[order])
+        rows = packed.size(0)
+        rows_cap = 1 if T <= 1 else 2 if T <= 2 else 4 if T <= 4 else 8
+        padded = packed.new_zeros((rows + rows_cap, x.size(1)))
+        padded[:rows] = packed
+        hidden = packed.new_zeros((rows + rows_cap, self.moe_intermediate_size))
+        out = packed.new_empty((rows + rows_cap, self.hidden_size))
+        tables = self._ensure_int4_segment_tables(x)
+        gate = self.experts[0].gate_proj
+        group = gate.w_int4.size(1) * 2 // gate.w_int4_scale.size(1)
+        extension = gate._cuda_int4_ext
+        if not extension.expert_out_compact(
+                padded, tables["gate_w"], tables["gate_s"],
+                tables["up_w"], tables["up_s"], tables["down_w"], tables["down_s"],
+                offsets, counts, hidden, out, T, rows, group):
+            return None
+        ys = out[:rows]
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(rows, device=x.device)
+        y_by_slot = ys[inverse].view(T, k, self.hidden_size)
+        slot_order = top_idx.argsort(dim=-1, stable=True)
+        y_expert_order = y_by_slot.gather(
+            1, slot_order[:, :, None].expand(T, k, self.hidden_size))
+        weights_expert_order = top_vals.gather(1, slot_order)
+        result = torch.zeros_like(x)
+        for slot in range(k):
+            result += y_expert_order[:, slot, :] * weights_expert_order[:, slot, None]
+        return result
 
     def _ensure_int4_segment_tables(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         linears = self._expert_linears()

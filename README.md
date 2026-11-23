@@ -55,7 +55,7 @@ This captures tuned CUDA graph/eager, FP8 and library cases, emitting `.nsys-rep
 SQLite and JSON. Focus the UI on `nsys_capture`; see the
 [kernel bottleneck report](benchmarks/_qwen_cuda_nsys_20261116.md).
 
-A from-scratch, vLLM-style inference engine for offline generation and local online serving, built on **PyTorch + Triton + flash-attn** — no inference framework dependency. It is developed and measured on an RTX 5060 Ti 16GB (Blackwell sm_120) under WSL2; benchmark claims are tied to dated evidence in [`INTERVIEW.md`](INTERVIEW.md) (Chinese master doc) and raw JSON under `results/`.
+A from-scratch, vLLM-style inference engine for offline generation and local online serving, built on **PyTorch + Triton + flash-attn** — no inference framework dependency. It is developed and measured on an RTX 5060 Ti 16GB (Blackwell sm_120) under WSL2; benchmark claims are tied to the dated reports under `benchmarks/` and raw JSON under `results/`.
 
 ## Key Features
 
@@ -63,7 +63,7 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 * 📖 **Paged KV cache** — block size 256; chained-hash **prefix cache** (partial blocks included) with copy-on-write safety, generation-invalidated lazy Top-W scheduling features, and free-block LRU reclamation; **SWA rolling cache** (`rolling_cache=True`, per-sequence ring eviction to window+B — bounded decode KV, Mistral full-window / Gemma-2 local layers) incl. a split dual-pool mode for Gemma-2's alternating local/global windows.
 * ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), Triton GEMMs for w8a8 / int4 / NVFP4 software / fp8 / 2:4-sparse weights, and a cuBLASLt NVFP4 native MMA backend.
 * 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|nvfp4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router**; NVFP4 E2M1/E4M3 block scaling with a Triton software path or native cuBLASLt FP4 MMA on Blackwell; AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill.
-* 🤖 **Speculative decoding** — n-gram / Medusa / EAGLE-1; verify uses prefix-reusing varlen prefill. Eligible non-rolling pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); ordinary MHA mixed Prefill/Decode batches use bounded, lazy shape-keyed CUDA Graphs, including Mistral rolling and Gemma-2 split-cache inputs. MLA and spec-mixed batches fall back to eager. sparse24 keeps its quantized Triton GEMM but uses eager forward because graph replay has produced mismatches in the engine probe. Acceptance preserves the target sampler's distribution.
+* 🤖 **Speculative decoding** — n-gram, Medusa, EAGLE-1/2/3, DFlash and DSpark. Chain verification uses prefix-reusing varlen prefill; EAGLE-2/3 add batched tree proposal and target-sampled traversal, with EAGLE-3 keeping a paged draft KV; DFlash drafts a block in one forward, and DSpark keeps that parallel backbone but adds a semi-autoregressive Markov head and prunes each request's block by a confidence/survival estimate. `ngram`/`medusa`/`eagle` pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); EAGLE-2/3, DFlash, DSpark, MLA and spec-mixed batches fall back to eager. sparse24 keeps its quantized Triton GEMM but uses eager forward because graph replay has produced mismatches in the engine probe. Acceptance preserves the target sampler's distribution.
 * 🧩 **Model zoo** — registry dispatch by `hf_config.model_type`; streaming layer-wise load + quantize-on-load (7B+ on 16GB).
 * 🌐 **Tensor parallelism** — NCCL + shared-memory command channel, `weight_loader`-based sharding.
 * 🔀 **PD stage separation (experimental)** — separate Prefill and Decode model/KV pools on two GPUs; prompt KV moves through host memory.
@@ -82,35 +82,55 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 
 Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
 `nvfp4_backend="software|cublaslt"`,
-`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3|dflash"`, `rolling_cache=True`,
+`kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3|dflash|dspark"`, `rolling_cache=True`,
 `kv_swap=True` (default), and `execution_mode="auto|mixed|pd"`. `example.py` is an end-to-end demo; `benchmarks/bench.py` produces
 the full TTFT/TPOT/E2E/p50/p99/SLO report and a JSON artifact under `results/`.
 
-Qwen3-0.6B supports EAGLE-2 and EAGLE-3 on one GPU with BF16 weights and ordinary
-paged KV. These modes execute eagerly. EAGLE-2 takes the same local `eagle_path`
-`.pt` file as EAGLE-1. EAGLE-3 takes a local directory containing `config.json`
-and `model.safetensors` from the supported Qwen3-0.6B draft checkpoint. Its draft
-KV is initialized during prefill, so it uses private target prefix blocks and
-recomputes preempted requests. Set `max_draft_len`, `eagle_tree_top_k`, and
-`eagle_tree_max_nodes` to control tree depth, frontier width, and draft node budget.
-EAGLE-2/3 expand draft frontiers across requests on the GPU. EAGLE-3 keeps one
-paged draft KV prefix per request and stores new branch rows in scratch space.
-Set `eagle_tree_policy="adaptive"` to adjust the budget with batch size and recent
-accepted draft length. It periodically probes a narrow tree after disabling
-speculation. The default `"fixed"` uses the configured limits.
-The paired EAGLE benchmark and reproduction commands are in the
+Qwen3-0.6B is the only model with in-tree trained drafters in this checkout.
+`ngram` is model-free. `medusa` loads a local head file; `eagle`/`eagle2` share
+a local EAGLE-1/2 `.pt`; `eagle3`, `dflash` and `dspark` take checkpoint
+directories. The EAGLE-2/3, DFlash and DSpark paths are gated to Qwen3-0.6B:
+one GPU, BF16 weights, ordinary paged KV, TP=1, no weight quantization and no
+rolling cache. They execute eagerly. EAGLE-3, DFlash and DSpark use private
+draft/prefix pages, disable cross-request prefix-cache sharing, and recompute
+preempted requests instead of swapping KV; EAGLE-2 keeps the normal prefix
+cache and can use KV swap.
+
+| `speculative` | Draft | Verification | Notes |
+|---|---|---|---|
+| `ngram` | last-occurrence n-gram / prompt lookup | chain | model-free; eligible pure-spec steps use CUDA Graphs |
+| `medusa` | γ+1 MLP heads, argmax | chain | `medusa_path`; Qwen3-0.6B heads |
+| `eagle` | one-layer autoregressive EAGLE-1 | chain | `eagle_path`; eligible pure-spec steps use CUDA Graphs |
+| `eagle2` | EAGLE-1 weights + confidence tree | tree | `eagle_path`; eager |
+| `eagle3` | 3-layer feature fusion + paged draft KV | tree | local checkpoint; eager |
+| `dflash` | block-diffusion draft, one forward | chain | local checkpoint; eager |
+| `dspark` | DFlash + Markov head + confidence head | chain with prefix pruning | local checkpoint; eager |
+
+EAGLE-2/3 expand draft frontiers across requests on the GPU. EAGLE-2 reuses
+the EAGLE-1 `.pt`; EAGLE-3 takes a directory containing `config.json` and
+`model.safetensors`. EAGLE-3 initializes one paged draft KV prefix per request
+and stores new branch rows in scratch space. Set `max_draft_len`,
+`eagle_tree_top_k`, and `eagle_tree_max_nodes` to control tree depth, frontier
+width, and draft node budget. `eagle_tree_policy="adaptive"` adjusts the budget
+with batch size and recent accepted draft length, periodically probing a narrow
+tree after disabling speculation; the default `"fixed"` uses the configured
+limits. The paired benchmark is in the
 [Qwen3-0.6B EAGLE comparison](benchmarks/_eagle_comparison_20261119.md).
 
-Set `speculative="dflash"` and `dflash_path="/path/to/draft"` for Qwen3-0.6B
-on a single GPU with BF16 and ordinary paged KV. The local directory contains
-`config.json` and `model.safetensors` for a matching full-attention DFlash
-Speculators draft. The draft uses one bidirectional forward per batch and the
-target verifies its proposals with the existing causal speculative path.
-`max_draft_len` bounds the proposed tokens. This path uses eager execution,
-private prefix pages, and recompute on preemption.
-[Supported public draft weights](https://huggingface.co/arnabwithab/Qwen3-0.6B-DFlash-noshift-b8/commit/b4a61819293fdb9106e648b0422c38dbf90bb3f4).
-The [DFlash comparison](benchmarks/_dflash_comparison_20261119.md) includes
-the paired benchmark and reproduction commands.
+Set `speculative="dflash"` and `dflash_path="/path/to/draft"` for the
+block-diffusion drafter. It conditions on target features, proposes a block in
+one bidirectional forward, and the target verifies the proposals with the
+existing causal path; `max_draft_len` bounds the proposed tokens. Set
+`speculative="dspark"` and `dspark_path="/path/to/draft"` for a DSpark
+checkpoint, which adds a low-rank Markov head and a confidence head.
+`select_prefixes` keeps each request's candidate prefix by prefix survival
+probability, using `dspark_confidence_threshold` (default 0.3) or, when
+`dspark_step_ms` is supplied from `benchmarks/dspark_verifier_cost.py`, the
+measured verifier-cost curve. Both paths are eager, use private prefix pages,
+and recompute on preemption.
+[Supported DFlash draft weights](https://huggingface.co/arnabwithab/Qwen3-0.6B-DFlash-noshift-b8/commit/b4a61819293fdb9106e648b0422c38dbf90bb3f4) ·
+[DFlash comparison](benchmarks/_dflash_comparison_20261119.md) ·
+[DSpark comparison](benchmarks/_dspark_comparison_20261120.md).
 
 For pure INT4 MoE experts, `moe_int4_backend="loop|segment"` selects the per-expert or
 segmented GEMM path; `moe_int4_fuse_gate_up` controls gate/up launch fusion on the segmented
@@ -120,13 +140,20 @@ DeepSeek-V2-Lite defaults to native CUDA W4A16 for single-GPU INT4 inference wit
 `int4_group_size=64` and the `loop` expert backend. Set `int4_kernel_backend="triton"`
 to run the Triton baseline. Weight quantization is enabled with `quantization="int4"`.
 
+Speculative decoding on DeepSeek-V2-Lite is n-gram-only in practice. The MLA
+verify path is chain-only (`MLAAttention` assembles cache-shaped K/V; there is
+no tree mask), and `ModelRunner` skips the spec CUDA Graph for MLA. EAGLE-2/3,
+DFlash and DSpark are gated to Qwen3-0.6B, and this checkout ships no
+DeepSeek-V2-Lite Medusa/EAGLE-1 draft weights. `benchmarks/spec_bench.py` also
+has no quantization/TP flags, so an INT4 DSV2-Lite spec run currently needs a
+custom harness.
+
 The 2026-10-12 DeepSeek-V2-Lite fixed-shape diagnostic matched split/fused token outputs
 in every random and greedy correctness case and found bitwise-equal sentinel logits and MoE
 values across all 26 MoE layers. Across 54 paired performance runs, fused output throughput
 had a +3.52% median delta (38 wins, 16 losses; -10.05% to +21.60%). The range crosses zero,
 so a stable gain is not established. This all-at-once batch with report-only SLO targets does
 not establish online serving goodput; keep fusion experimental. See
-[`INTERVIEW.md` §10.3.17](INTERVIEW.md) and
 [`benchmarks/_moe_report.md`](benchmarks/_moe_report.md).
 
 A later online diagnostic replayed five paired arrival traces and found one recurring
@@ -134,8 +161,8 @@ request-23/token-48 mismatch. The layer-1 query input was identical, but its log
 state differed in the failing pair. Replaying either frozen state under both observed
 24-row orders produced bitwise-identical outputs, so the current batch row permutation
 does not explain the mismatch. The earlier KV difference remains under investigation;
-fusion stays experimental. See [`INTERVIEW.md` §10.3.18](INTERVIEW.md),
-[`benchmarks/_moe_report.md`](benchmarks/_moe_report.md), and
+fusion stays experimental. See
+[`benchmarks/_moe_report.md`](benchmarks/_moe_report.md) and
 [`benchmarks/moe_int4_arrival_diag.py`](benchmarks/moe_int4_arrival_diag.py).
 
 ### 2026-10-15 supplemental screening
@@ -174,8 +201,9 @@ delta (95% bootstrap CI -0.35% to +5.11%) and identical request outputs in 14/25
 Keep fusion experimental. MLA cache assembly now computes each query end as
 `start + qlen`; a follow-up 16-request replay still recorded one output mismatch, so
 the earlier online divergence is not fully resolved. N-gram acceptance tracked output
-repetition in the sampled content classes, but no Medusa/EAGLE draft weights were
-available. Full conditions and limits are in
+repetition in the sampled content classes. At the time of that screen no Medusa/EAGLE
+draft weights were available; later Qwen3-0.6B checkpoints and paired comparisons are
+linked above. Full conditions and limits are in
 [`benchmarks/_supplemental_report.md`](benchmarks/_supplemental_report.md); raw files
 are under the ignored `results/supplemental/` directory.
 
@@ -316,7 +344,7 @@ was -20.3% to +31.9%. Both backends met joint SLO for all 16 requests in every r
 generated tokens matched in five of six pairs. Same-backend repeats also changed output
 fingerprints in three of six repeat comparisons. Since every run passed SLO, the tests
 have not located the joint-goodput knee; this positive median is not enough to claim a
-stable fusion benefit. See `INTERVIEW.md` §10.3.16.
+stable fusion benefit. See `benchmarks/_moe_report.md`.
 
 A follow-up sweep on 2026-10-11 used 24 requests per condition, three seeds, and three
 repeats per seed (nine paired traces per cell), with 16/24/32 req/s arrival rates and
@@ -332,7 +360,8 @@ are in `results/moe_int4_fuse_load150_20261011.json`,
 `results/moe_int4_fuse_load125_20261011.json`, and
 `results/moe_int4_fuse_load100_long_20261011.json`.
 
-A finer 2026-10-11 sweep measured 105/110/115/120 ms TPOT at 24/32 req/s with 64/128 output tokens, three seeds, and five paired repetitions per cell (240 pairs). For 128-token output, fused throughput had a +2.24% median delta (70 wins, 50 losses; -17.93% to +18.16%); 64-token output had +0.81% (64 wins, 56 losses; -28.65% to +29.87%). Joint-SLO goodput deltas varied widely, so the longer-output benefit is still conditional and not repeat-stable. SM-clock medians stayed at 2775 MHz (2760–2775); decode batch p50/max was 24 rows, although the full per-pair shape histograms matched in only 53/240 pairs. Greedy output parity was 212/240; all 28 mismatches were one seed-42 request at output token index 48. Keep fusion experimental while investigating this batch-sensitive divergence. See `INTERVIEW.md` §10.3.16, `benchmarks/_moe_report.md`, and `results/moe_int4_fuse_load105_120_rep5_20261011.json`.
+A finer 2026-10-11 sweep measured 105/110/115/120 ms TPOT at 24/32 req/s with 64/128 output tokens, three seeds, and five paired repetitions per cell (240 pairs). For 128-token output, fused throughput had a +2.24% median delta (70 wins, 50 losses; -17.93% to +18.16%); 64-token output had +0.81% (64 wins, 56 losses; -28.65% to +29.87%). Joint-SLO goodput deltas varied widely, so the longer-output benefit is still conditional and not repeat-stable. SM-clock medians stayed at 2775 MHz (2760–2775); decode batch p50/max was 24 rows, although the full per-pair shape histograms matched in only 53/240 pairs. Greedy output parity was 212/240; all 28 mismatches were one seed-42 request at output token index 48. Keep fusion experimental while investigating this batch-sensitive divergence. See
+`benchmarks/_moe_report.md` and `results/moe_int4_fuse_load105_120_rep5_20261011.json`.
 
 ```bash
 python benchmarks/moe_int4_ablation.py ~/huggingface/DeepSeek-V2-Lite \
@@ -413,8 +442,9 @@ The HTTP server runs mixed prefill/decode batches eagerly by default so a live r
 pay the first-use cost of capturing a new mixed CUDA Graph shape. Pure decode graphs remain
 available when supported. Pass `--mixed-cudagraph` to opt in to lazy mixed-graph capture; the
 first request with each unseen shape still pays its capture cost. Direct `LLM`/`Config` use keeps
-its existing mixed-graph default. This serving choice is based on the Qwen3-0.6B WSL2 results in
-`INTERVIEW.md` §10.3.13; other models and GPUs need their own same-trace measurement.
+its existing mixed-graph default. This serving choice is based on the Qwen3-0.6B WSL2
+measurements in the dated reports under `benchmarks/`; other models and GPUs need their
+own same-trace measurement.
 
 Pass a `conversation_id` to keep chat history between calls. The first call can include a
 system message and a user message; later calls send only the new user message. History lives
@@ -682,9 +712,10 @@ available for measurement, not claims that every combination has been verified o
 
 Combination boundaries: KV swap is active only for TP=1 and otherwise uses recompute; PD mode
 still requires `kv_cache_dtype="auto"` and does not support rolling cache. Mixed graphs cover MHA
-paths up to the configured token cap; MLA and spec-mixed batches stay eager. Mistral rolling with
-n-gram verification also uses eager verification, while its ordinary decode and mixed batches can
-use graphs.
+paths up to the configured token cap; MLA and all spec-mixed batches stay eager. Pure-spec graphs
+cover only the legacy `ngram`/`medusa`/`eagle` modes on non-MLA, non-rolling models; EAGLE-2/3,
+DFlash and DSpark are eager. Mistral rolling with n-gram verification also uses eager
+verification, while its ordinary decode and mixed batches can use graphs.
 
 The scheduler policies and admission controller have ablation harnesses, but the performance
 table below predates those changes. It records earlier single-GPU runs and does not establish
@@ -788,14 +819,15 @@ archived run: **5,825 tok/s** (FP8 weights, Qwen3-0.6B, bs=256).
 
 Honest boundaries: these are single-card WSL2 numbers for a 0.6B model; decode single-step
 latencies are at parity with vLLM fp16, and several features (e.g. pure-int4 large batch,
-2:4 sparsity, EAGLE γ=4, KV swap on this machine) are *documented losses* — see
-[`INTERVIEW.md`](INTERVIEW.md) §10 (基准档案) for the full tables, conditions, and what to
-re-run after changing environment.
+2:4 sparsity, legacy EAGLE-1 γ=4, the eager EAGLE-2/3/DFlash/DSpark paths, KV swap on this
+machine) are *documented losses* — see the dated reports under `benchmarks/` and raw JSON
+under `results/` for the full tables, conditions, and what to re-run after changing
+environment.
 
 ## Documentation
 
 * [`CLAUDE.md`](CLAUDE.md) — architecture deep-dive (offline/online request lifecycle, Context contract, KV/paging/offload, scheduling, quantization, speculative decoding, PD) and dev-machine gotchas.
-* [`INTERVIEW.md`](INTERVIEW.md) — **master doc** (Chinese): learning route with per-feature code pointers, interview narrative, 18 pitfall stories, deep-dive Q&A, benchmark archive, and a symbol-based code map. (Consolidated from the former BENCHMARKS.md / LEARNING.md / INTERVIEW.md.)
+* `benchmarks/_*.md` — dated experiment reports (CUDA kernels, quantization, scheduling, speculative decoding) with conditions and raw JSON pointers.
 * [`AGENTS.md`](AGENTS.md) — contribution guidelines (style, commit conventions, testing).
 * `benchmarks/_stage2b_ext_report.md` — evidence tables for the stage-2 MLA / rolling-ring / fp8-KV-combination work.
 
@@ -813,13 +845,13 @@ non-sharing cache modes, and metrics reset without changing live state.
 
 ```
 nanovllm/
-├─ engine/    LLMEngine · Scheduler · BlockManager · Sequence · ModelRunner · KV transfer
-├─ layers/    attention (+ MLA) · linear (quant kernels) · moe · layernorm · rope · embed_head · sampler · medusa · eagle
+├─ engine/    LLMEngine · Scheduler · BlockManager · Sequence · ModelRunner · eagle_tree · KV transfer
+├─ layers/    attention (+ MLA) · linear (quant kernels) · moe · layernorm · rope · embed_head · sampler · medusa · eagle · eagle3 · dflash · dspark
 ├─ models/    per-family modules + model_type registry
 ├─ server.py  OpenAI-style HTTP/SSE service and in-memory conversations
 └─ utils/     weight loader · Context singleton (per-step data contract)
 tests/        pytest suite
-benchmarks/   bench.py · context_concurrency.py · kv_fp8_calibrate.py · scheduling_ablation.py · profiler.py · nsys_profile.py · probes & reports (see INTERVIEW.md §1.8)
+benchmarks/   bench.py · context_concurrency.py · kv_fp8_calibrate.py · scheduling_ablation.py · profiler.py · nsys_profile.py · probes & dated reports
 ```
 
 ## Nsight Systems profiling

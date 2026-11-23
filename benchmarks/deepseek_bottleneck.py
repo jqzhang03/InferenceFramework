@@ -21,7 +21,7 @@ from nanovllm.layers.cuda_int4 import set_cuda_int4_expert_fusion
 
 WORKLOADS = {"b1_ctx64": (1, 64), "b4_ctx64": (4, 64),
              "b8_ctx64": (8, 64), "b4_ctx512": (4, 512)}
-MODES = ("triton_loop", "cuda_loop", "cuda_compact")
+MODES = ("triton_loop", "cuda_loop", "cuda_compact", "cuda_gpu_compact")
 
 
 def reuse_index(moe, x: torch.Tensor) -> torch.Tensor:
@@ -66,6 +66,7 @@ class Variants:
         self.model = engine.model_runner.model
         self.moes = [module for _, module in trace.moes]
         self.loops = [module._forward_loop for module in self.moes]
+        self.compacts = [module._forward_compact_int4 for module in self.moes]
         self.cuda_linears = [(module, module._cuda_int4_ext) for module in self.model.modules()
                              if hasattr(module, "_cuda_int4_ext")]
         self.annotate = annotate
@@ -75,7 +76,7 @@ class Variants:
         for module, ext in self.cuda_linears:
             module._cuda_int4_ext = ext if use_cuda else None
         set_cuda_int4_expert_fusion(self.model, "full" if use_cuda else "none")
-        for module, original in zip(self.moes, self.loops):
+        for module, original, compact in zip(self.moes, self.loops, self.compacts):
             if mode == "cuda_compact":
                 call = MethodType(compact_dispatch, module)
             elif mode == "cuda_index_once":
@@ -83,6 +84,9 @@ class Variants:
             else:
                 call = original
             module._forward_loop = scoped(call, "routed_experts") if self.annotate else call
+            module._forward_compact_int4 = (scoped(compact, "routed_experts")
+                                            if self.annotate else compact)
+            module.int4_backend = "compact" if mode == "cuda_gpu_compact" else "loop"
 
 
 def scoped(fn, phase: str):
@@ -146,6 +150,8 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=Path("~/huggingface/DeepSeek-V2-Lite"))
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--trace", action="store_true")
+    parser.add_argument("--workloads", default=",".join(WORKLOADS),
+                        help="comma-separated subset of the four timing workloads")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
@@ -162,7 +168,12 @@ def main() -> None:
     variants = Variants(llm, trace, args.trace)
     if args.trace:
         annotate_model(variants.model)
-    workloads = ("b4_ctx64", "b4_ctx512") if args.trace else WORKLOADS
+    if args.trace:
+        workloads = ("b4_ctx64", "b4_ctx512")
+    else:
+        workloads = tuple(args.workloads.split(","))
+        if not workloads or any(name not in WORKLOADS for name in workloads):
+            parser.error(f"--workloads must be a subset of {sorted(WORKLOADS)}")
     vocab = llm.config.hf_config.vocab_size
     filename = "trace_workloads.json" if args.trace else "timing.json"
     output = dict(environment=environment(), kv_blocks=llm.config.num_kvcache_blocks, workloads={})
@@ -178,9 +189,14 @@ def main() -> None:
         routes = dict(trace.observed_routes)
         forced = torch.tensor(tokens, device="cuda").T.contiguous()
 
-        modes = (("cuda_loop", "cuda_compact") if args.trace else MODES)
-        if workload == "b4_ctx64":
-            modes += ("cuda_index_once",)
+        if args.trace:
+            modes = (("cuda_loop", "cuda_compact", "cuda_gpu_compact")
+                     if workload == "b4_ctx64"
+                     else ("cuda_loop", "cuda_gpu_compact"))
+        else:
+            modes = MODES
+            if workload == "b4_ctx64":
+                modes += ("cuda_index_once",)
         timed, parity = [], {}
         if not args.trace:
             reference = None
@@ -192,7 +208,16 @@ def main() -> None:
                 if reference is None:
                     reference = logits
                 parity[mode] = error_metrics(logits, reference)
-                if mode != "triton_loop" and not parity[mode]["bitwise_equal"]:
+                if mode == "cuda_gpu_compact" and not parity[mode]["bitwise_equal"]:
+                    # Experts with 5-8 rows take the MMA path in the reference
+                    # loop and the GEMV path in the compact kernel; accumulation
+                    # order is unchanged, but BF16 round-off differs. Keep this
+                    # tolerance tight enough to catch a real dispatch error.
+                    if parity[mode]["relative_l2"] > 1e-2:
+                        raise RuntimeError(
+                            f"compact dispatch changed model logits for {workload}: "
+                            f"{parity[mode]}")
+                elif mode != "triton_loop" and not parity[mode]["bitwise_equal"]:
                     raise RuntimeError(f"dispatch changed model logits for {workload}: {mode}, {parity[mode]}")
         orders = list(permutations(modes))
         if len(modes) == 4:

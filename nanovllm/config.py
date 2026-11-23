@@ -61,7 +61,7 @@ class Config:
     quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见INTERVIEW.md §10.3.6）
     int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见INTERVIEW.md §10.3.6。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突；MLA kv_b 例外保留反量化副本）
     int4_group_size: int = 128 # int4 量化组大小（K 维，须整除各线性层 K）。DeepSeek-V2-Lite 的 dense 中间维 10944 = 64×171 不能被 128 整除 → 该模型需 64（精度代价小，官方社区 int4 同样受此约束）
-    moe_int4_backend: str = "loop" # 纯 INT4 MoE 专家：loop（逐专家）| segment（无 padding 分段 Triton；仅 TP=1、非 AWQ、无 w_deq）
+    moe_int4_backend: str = "loop" # 纯 INT4 MoE 专家：loop（逐专家）| segment（无 padding 分段 Triton；仅 TP=1、非 AWQ、无 w_deq）| compact（decode ≤8 行走 GPU 路由 + expert 2D grid 的 CUDA W4A16；更大 prefill 走每层一次 host 打包以保持位级一致；仅 TP=1、非 AWQ、无 w_deq）
     moe_int4_fuse_gate_up: bool = True # segment INT4 时将 gate/up 投影合并为一次 GEMM launch；False 用于融合消融
     streaming_load: bool = False # 按层流式加载+即时量化（16GB 卡跑 7B+ 的前提，见 INTERVIEW.md §1.7）：模型在 meta 设备构造（0显存）→ loader 逐 decoder layer 物化→加载→立即量化→释放 fp16。显式开启；或当估算 fp16 权重超过空闲显存 45% 且启用了权重量化时自动开启（7B+ 必触发）。限制：int4 强制纯 int4（无 w_deq，MLA kv_b 例外保留反量化副本 ~1%）；w8a8 无 SmoothQuant 校准（需全模型前向）；awq 仅支持预生成 awq_scales_path（内联校准需全 fp16 模型）
     speculative: str = "none" # 投机解码："none" | "ngram"（n-gram/prompt-lookup草稿，无模型零显存，见INTERVIEW.md §10.3.5）| "medusa"（Medusa多头，需medusa_path）| "eagle"（EAGLE-1草稿层：无RoPE transformer层 + 共享LM head 自回归草稿，需eagle_path）
@@ -153,7 +153,7 @@ class Config:
             f"unknown speculative: {self.speculative}"
         assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "awq", "sparse24", "fp8"), \
             f"unknown quantization: {self.quantization}"
-        assert self.moe_int4_backend in ("loop", "segment"), \
+        assert self.moe_int4_backend in ("loop", "segment", "compact"), \
             f"unknown MoE INT4 backend: {self.moe_int4_backend!r}"
         assert self.int4_kernel_backend in (None, "triton", "cuda"), \
             f"unknown INT4 kernel backend: {self.int4_kernel_backend!r}"
@@ -201,8 +201,11 @@ class Config:
         if self.int4_kernel_backend is None:
             self.int4_kernel_backend = self._default_int4_kernel_backend()
         if self.int4_kernel_backend == "cuda":
-            assert self.quantization == "int4" and self.moe_int4_backend == "loop", \
-                "CUDA W4A16 requires quantization='int4' and moe_int4_backend='loop'"
+            assert self.quantization == "int4" and self.moe_int4_backend in ("loop", "compact"), \
+                "CUDA W4A16 requires quantization='int4' and moe_int4_backend in ('loop','compact')"
+        if self.moe_int4_backend == "compact":
+            assert self.int4_kernel_backend == "cuda" and self.tensor_parallel_size == 1, \
+                "compact INT4 MoE requires the CUDA W4A16 backend and TP=1"
         if self.cuda_int4_expert_fusion != "none":
             assert self.int4_kernel_backend == "cuda" and self.tensor_parallel_size == 1, \
                 "CUDA INT4 expert fusion requires the CUDA W4A16 backend and TP=1"
@@ -242,7 +245,8 @@ class Config:
                 and shape == (2048, 10944, 1408, 27, 64)
                 and str(getattr(hf, "dtype", None)) in ("torch.float16", "torch.bfloat16", "float16", "bfloat16")
                 and self.quantization == "int4" and self.int4_group_size == 64
-                and self.moe_int4_backend == "loop" and self.tensor_parallel_size == 1
+                and self.moe_int4_backend in ("loop", "compact")
+                and self.tensor_parallel_size == 1
                 and self.execution_mode != "pd"):
             return "cuda"
         return "triton"
