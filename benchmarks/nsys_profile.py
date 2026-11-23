@@ -285,10 +285,18 @@ def _parse_args() -> argparse.Namespace:
                         help="INT4 K-group size; DeepSeek-V2-Lite requires 64")
     parser.add_argument("--streaming-load", action="store_true",
                         help="load and quantize one layer at a time for large checkpoints")
-    parser.add_argument("--moe-int4-backend", choices=("loop", "segment"),
+    parser.add_argument("--moe-int4-backend", choices=("loop", "segment", "compact"),
                         default="loop", help="DeepSeek INT4 MoE implementation")
+    parser.add_argument("--moe-int4-cta-fanout", type=int, default=0,
+                        help="compact decode CTA fan-out; 0=auto")
     parser.add_argument("--no-moe-int4-fuse-gate-up", action="store_true",
                         help="split segmented INT4 MoE gate/up kernels")
+    parser.add_argument("--no-moe-int4-fuse-silu", action="store_true",
+                        help="compact INT4: keep two gate/up outputs and the torch elementwise")
+    parser.add_argument("--max-num-seqs", type=int, default=32,
+                        help="maximum scheduled sequences (graph sizes follow this)")
+    parser.add_argument("--cuda-graph", action="store_true",
+                        help="enable decode CUDA graph instead of forced eager")
     parser.add_argument("--warmup-seqs", type=int, default=8,
                         help="number of shape-matched warmup requests; 0 uses all")
     parser.add_argument("--gpu-event-json", default="profiles/nsys_gpu_event_summary.json",
@@ -324,25 +332,28 @@ def main() -> None:
         raise ValueError("--int4-group-size must be positive")
     if args.streaming_load and args.quantization == "none":
         raise ValueError("--streaming-load requires --quantization int4")
-    if args.moe_int4_backend == "segment" and args.quantization != "int4":
-        raise ValueError("--moe-int4-backend segment requires --quantization int4")
+    if args.moe_int4_backend in ("segment", "compact") and args.quantization != "int4":
+        raise ValueError("--moe-int4-backend segment/compact requires --quantization int4")
     if args.tp != 1:
         raise ValueError("Nsight layer annotations currently require tensor parallel size 1")
     args.model = os.path.expanduser(args.model)
 
     engine = LLM(
         args.model,
-        enforce_eager=True,
+        enforce_eager=not args.cuda_graph,
         execution_mode="mixed",
         tensor_parallel_size=args.tp,
         max_model_len=args.max_model_len,
+        max_num_seqs=args.max_num_seqs,
         gpu_memory_utilization=args.gpu_memory_utilization,
         quantization=args.quantization,
         int4_group_size=args.int4_group_size,
         int4_dense_path=not args.streaming_load,
         streaming_load=args.streaming_load,
         moe_int4_backend=args.moe_int4_backend,
+        moe_int4_cta_fanout=args.moe_int4_cta_fanout,
         moe_int4_fuse_gate_up=not args.no_moe_int4_fuse_gate_up,
+        moe_int4_fuse_gate_up_silu=not args.no_moe_int4_fuse_silu,
         multi_step_decode=False,
         kv_swap=False,
     )
@@ -358,10 +369,11 @@ def main() -> None:
     hooks, module_ranges, gpu_events = _install_nvtx_ranges(engine)
     print(
         f"[nsys] model={args.model}; requests={len(prompts)}; "
-        f"prompt_tokens={sum(map(len, prompts))}; eager=True; "
+        f"prompt_tokens={sum(map(len, prompts))}; eager={not args.cuda_graph}; "
         f"quantization={args.quantization}; int4_group_size={args.int4_group_size}; "
         f"streaming_load={args.streaming_load}; "
         f"moe_int4_backend={args.moe_int4_backend}; "
+        f"moe_int4_cta_fanout={args.moe_int4_cta_fanout}; "
         f"moe_int4_fuse_gate_up={not args.no_moe_int4_fuse_gate_up}; "
         f"multi_step_decode=False; {model_label} module ranges={module_ranges}",
         flush=True,
@@ -394,12 +406,15 @@ def main() -> None:
             "model_type": engine.config.hf_config.model_type,
             "model_label_prefix": model_label,
             "device": torch.cuda.get_device_name(0),
-            "execution_mode": "eager",
+            "execution_mode": "graph" if args.cuda_graph else "eager",
+            "cuda_graph": args.cuda_graph,
             "tensor_parallel_size": args.tp,
+            "max_num_seqs": args.max_num_seqs,
             "quantization": args.quantization,
             "int4_group_size": args.int4_group_size,
             "streaming_load": args.streaming_load,
             "moe_int4_backend": args.moe_int4_backend,
+            "moe_int4_cta_fanout": args.moe_int4_cta_fanout,
             "moe_int4_fuse_gate_up": not args.no_moe_int4_fuse_gate_up,
             "multi_step_decode": False,
             "num_requests": len(prompts),

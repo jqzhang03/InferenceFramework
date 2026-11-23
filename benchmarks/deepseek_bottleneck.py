@@ -20,7 +20,9 @@ from nanovllm.layers.cuda_int4 import set_cuda_int4_expert_fusion
 
 
 WORKLOADS = {"b1_ctx64": (1, 64), "b4_ctx64": (4, 64),
-             "b8_ctx64": (8, 64), "b4_ctx512": (4, 512)}
+             "b8_ctx64": (8, 64), "b4_ctx512": (4, 512),
+             "b16_ctx64": (16, 64), "b32_ctx64": (32, 64)}
+DEFAULT_WORKLOADS = ("b1_ctx64", "b4_ctx64", "b8_ctx64", "b4_ctx512")
 MODES = ("triton_loop", "cuda_loop", "cuda_compact", "cuda_gpu_compact")
 
 
@@ -150,8 +152,12 @@ def main() -> None:
     parser.add_argument("--model", type=Path, default=Path("~/huggingface/DeepSeek-V2-Lite"))
     parser.add_argument("--repeats", type=int, default=6)
     parser.add_argument("--trace", action="store_true")
-    parser.add_argument("--workloads", default=",".join(WORKLOADS),
-                        help="comma-separated subset of the four timing workloads")
+    parser.add_argument("--workloads", default=",".join(DEFAULT_WORKLOADS),
+                        help="comma-separated subset of the timing workloads")
+    parser.add_argument("--cta-fanout", type=int, default=0,
+                        help="compact decode CTA fan-out per expert; 0=auto")
+    parser.add_argument("--max-num-seqs", type=int, default=8,
+                        help="maximum scheduled sequences (raise for b16/b32)")
     args = parser.parse_args()
     if args.repeats < 1:
         parser.error("--repeats must be positive")
@@ -159,8 +165,9 @@ def main() -> None:
     torch.set_num_threads(1)
     llm = LLM(str(args.model.expanduser()), quantization="int4", int4_group_size=64,
               streaming_load=True, int4_dense_path=False, int4_kernel_backend="cuda",
+              moe_int4_backend="compact", moe_int4_cta_fanout=args.cta_fanout,
               enforce_eager=True, execution_mode="mixed", max_model_len=520,
-              max_num_batched_tokens=2048, max_num_seqs=8, gpu_memory_utilization=.85,
+              max_num_batched_tokens=2048, max_num_seqs=args.max_num_seqs, gpu_memory_utilization=.85,
               multi_step_decode=False, kv_swap=False, latency_aware_scheduling=False,
               slo_aware_scheduling=False, tpot_aware_scheduling=False, cache_affinity_admission=False)
     llm.scheduler.block_manager.no_share = True
@@ -208,16 +215,7 @@ def main() -> None:
                 if reference is None:
                     reference = logits
                 parity[mode] = error_metrics(logits, reference)
-                if mode == "cuda_gpu_compact" and not parity[mode]["bitwise_equal"]:
-                    # Experts with 5-8 rows take the MMA path in the reference
-                    # loop and the GEMV path in the compact kernel; accumulation
-                    # order is unchanged, but BF16 round-off differs. Keep this
-                    # tolerance tight enough to catch a real dispatch error.
-                    if parity[mode]["relative_l2"] > 1e-2:
-                        raise RuntimeError(
-                            f"compact dispatch changed model logits for {workload}: "
-                            f"{parity[mode]}")
-                elif mode != "triton_loop" and not parity[mode]["bitwise_equal"]:
+                if mode != "triton_loop" and not parity[mode]["bitwise_equal"]:
                     raise RuntimeError(f"dispatch changed model logits for {workload}: {mode}, {parity[mode]}")
         orders = list(permutations(modes))
         if len(modes) == 4:

@@ -16,14 +16,64 @@ _dspark_comparison_20261120.md.
 Route-major INT4 MoE decode (2026-11-22): `Config.moe_int4_backend="compact"`
 sorts routes on the GPU (stable argsort + fixed-size `index_add_` histogram +
 cumsum) and runs a 2D-grid CUDA W4A16 expert kernel that reads device
-offsets/counts. Decode batches of at most 8 rows have zero routed-expert
-D2H/sync; larger prefill chunks use one route read per layer so they keep the
-existing MMA expert path bitwise. On 4×64, decode routed D2H is 0 vs 4,992 and
-TPOT is ~60 ms vs ~536 ms for the loop, but b8 experts with 5–8 rows take GEMV
-while the reference takes MMA, so b8 logits differ only at BF16 round-off
-(relative L2 4.9e-3) and the benchmark uses a tolerance there. Default remains
-`loop`. Tests: `tests/test_moe_int4_compact.py` (31 passed). See
-`benchmarks/_deepseek_compact_20261122.md`.
+offsets/counts. The same kernel covers decode and prefill: 1–4-row experts use
+GEMV, 5–8/9–16/17+‑row experts use MMA8/16/32 with a chunk-stride loop, so
+b1/b4/b8/b16/b32 and prefill chunks up to 4096 rows are bitwise against the
+loop. Only >4096-row chunks use the host fallback. CTA fan-out is auto: 8 per
+expert for T≤4, 128 for 5≤T≤8, 64 for T>8; the MMA32 grid caps its row-chunk
+dimension at 4 and each CTA walks the remaining chunks, so prefill does not
+launch a CTA per chunk. Compact 5+-row gate/up share one 128-thread MMA kernel
+(four warps split gate/up for the 8/16-row templates; the 32-row template gives
+each warp both projections for its own eight rows), and its epilogue now writes
+`silu(gate)*up` in place (2026-11-23 follow-up below), while down remains a
+separate kernel because it needs the complete intermediate.
+With auto fan-out, TPOT is ~56–64 ms on the 64-token
+b1/b4/b8 loads and ~59 ms on 4×512, versus 540–653 ms for the loop.
+`enforce_eager=False` plus compact captures decode graphs for batch
+1/2/4/8/16/32; batch>32 falls back eager. In the 6-repeat fused check, graph
+TPOT is 19.18 / 30.88 / 49.60 / 74.24 / 95.72 ms for b1/b4/b8/b16/b32 versus
+the pre-fusion 19.43 / 30.75 / 52.11 / 74.37 / 94.82 ms; b8 gains 4.8%, the
+others are flat/noise, tokens match and graph fallbacks are zero. On the
+32-request ShareGPT capture, GPU prefill removes the
+per-layer route D2H (prefill/mixed 27→1 sampler-only; 12,851→2,269 kernels)
+and the 5,180 per-expert MMA launches, while prefill wall stays ~889 ms
+(compact MMA32 ≈ reference MMA and the small-expert GEMV tail adds ~70 ms).
+The final ShareGPT run (warmup 32, graph) measures 234.6 output tok/s,
+TPOT 111.2 ms and warm TTFT 915 ms (cold first run 1.86 s from a first-shape
+prefill compile); the nsys capture is 4.26 s with 96.9% GPU active, split into
+689 ms prefill / 111 ms mixed / 3,452 ms decode. Prefill's largest kernels are
+fused gate/up 211.6 ms, dense/shared 175.9 ms and compact MMA 130.5 ms, so the
+remaining bottleneck is prefill GPU work plus decode expert projection, not
+D2H/launch. See `benchmarks/_deepseek_sharegpt_final_perf_20261123.md`.
+Default remains `loop`. Tests: `tests/test_moe_int4_compact.py` (51 passed)
+and the INT4/model regression (84 passed). See
+`benchmarks/_deepseek_compact_20261122.md`,
+`benchmarks/_deepseek_sharegpt_gpu_prefill_20261123.md` and
+`benchmarks/_deepseek_compact_fusion_20261123.md`.
+
+Compact gate/up SiLU fusion (2026-11-23): `Config.moe_int4_fuse_gate_up_silu`
+(default true; `--no-moe-int4-fuse-silu` on bench.py/nsys_profile.py/
+compact_graph.py ablates it) makes the 5+-row compact gate/up kernel write
+`silu(gate)*up` through `gemm_gate_up_silu_compact`, so gate/up are never
+written back and Python no longer issues the per-layer `F.silu`+`mul`; the
+1–4-row GEMV path already fused it. The 32-row template gives each of the four
+warps both projections for its own eight rows (same 4 accumulators, same
+13,312 B shared tile, no cross-warp staging or extra barrier) after the naive
+variant — keep the split warp roles, stage gate through shared — measured
+kernel-level regressions of +8.8% at T=2048 and +23% at 48 rows/expert; the
+8/16-row templates keep the warp-pair split plus a shared gate scratch because
+a 4-warp re-layout there would inflate the shared tile (18–34 KB).
+`silu_product` keeps ATen's rounding so outputs are bitwise identical to the
+split path and to the per-expert loop (fused vs split bf16/fp16 both
+`atol=rtol=0`, plus a graph-replay case). Kernel-level the gate/up kernel is
+1–5% faster (3–11% including the removed elementwise). Nsys ShareGPT prefill
+drops 497→445 elementwise kernels (19.94→7.86 ms) and the gate/up kernel
+199.8→196.2 ms; a paired single-process prefill A/B measures −2~−4% (16/20
+pairs, high variance) while decode TPOT is unchanged within ±1.8% because
+b≤32 keeps most experts on the already-fused GEMV path. Prefill stays
+weight-streaming bound, so the end-to-end gain is small. See
+`benchmarks/_deepseek_silu_fusion_20261123.md` and
+`benchmarks/compact_silu_fusion.py`.
 
 Warp GEMV follow-up (2026-11-17): --warp-gemv-study --output <fresh-dir> and
 --warp-gemv-pytest cover M1-4 Decode38–49 (warp/subwarp-owned outputs, register

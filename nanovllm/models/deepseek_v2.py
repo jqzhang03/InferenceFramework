@@ -78,6 +78,8 @@ class DeepseekV2Moe(MoE):
             segment_backend=bool(getattr(config, "moe_segment_backend", False)),
             int4_backend=getattr(config, "moe_int4_backend", "loop"),
             fuse_int4_gate_up=bool(getattr(config, "moe_int4_fuse_gate_up", True)),
+            fuse_gate_up_silu=bool(getattr(config, "moe_int4_fuse_gate_up_silu", True)),
+            cta_fanout=int(getattr(config, "moe_int4_cta_fanout", 0)),
         )
         # 共享专家 = 更宽的 dense FFN（intermediate = moe_intermediate × n_shared）
         self.shared_experts = DeepseekV2MLP(

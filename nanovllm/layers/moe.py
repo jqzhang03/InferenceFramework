@@ -76,7 +76,8 @@ class MoE(nn.Module):
                  num_experts: int, top_k: int, norm_topk_prob: bool = False,
                  segment_backend: bool = False,
                  int4_backend: str = "loop", fuse_int4_gate_up: bool = True,
-                 routed_scaling_factor: float = 1.0):
+                 fuse_gate_up_silu: bool = True,
+                 routed_scaling_factor: float = 1.0, cta_fanout: int = 0):
         super().__init__()
         assert num_experts > 0 and 1 <= top_k <= num_experts
         self.hidden_size = hidden_size
@@ -93,8 +94,15 @@ class MoE(nn.Module):
         self.segment_backend = segment_backend
         if int4_backend not in ("loop", "segment", "compact"):
             raise ValueError(f"unknown MoE INT4 backend: {int4_backend!r}")
+        if cta_fanout < 0:
+            raise ValueError(f"cta_fanout must be non-negative, got {cta_fanout}")
         self.int4_backend = int4_backend
         self.fuse_int4_gate_up = fuse_int4_gate_up
+        # compact：5+ 行 expert 的 gate/up MMA 在 epilogue 里直接算 silu(g)·u，
+        # 不再写回 gate/up 两份 intermediate、也不再需要 Python 的 elementwise。
+        # False 保留旧的“两输出 + F.silu(gate)*up”，仅用于位级/性能消融。
+        self.fuse_int4_gate_up_silu = fuse_gate_up_silu
+        self.cta_fanout = cta_fanout
         self.gate = ReplicatedLinear(hidden_size, num_experts, bias=False)  # [E, H]
         self.gate.quantize_exclude = True  # router 精度决定路由 → 永不量化
         self.experts = nn.ModuleList(
@@ -218,13 +226,11 @@ class MoE(nn.Module):
     def _can_compact_int4(self, x: torch.Tensor) -> bool:
         """The route-major CUDA path handles the decode row ranges it was built for.
 
-        The expert kernel is templated for at most eight activation rows per
-        expert, and every expert still gets a capped CTA fan-out. Larger prefill
-        chunks go through ``_forward_compact_host`` so they keep the existing MMA
-        expert kernels and bitwise reference outputs. In decode, an expert with
-        5-8 rows uses this GEMV path while the loop reference uses MMA; the
-        accumulator order is identical and the logits differ only at BF16
-        round-off (validated in benchmarks/deepseek_bottleneck.py).
+        The expert kernels cover 1-32 activation rows per expert, and every
+        expert still gets a capped CTA fan-out. Experts with 1-4 rows use GEMV
+        and 5-8/9-16/17-32 rows use MMA8/16/32, matching the reference
+        dispatch; larger prefill chunks go through ``_forward_compact_host`` so
+        they keep the existing MMA kernels and bitwise outputs.
         """
         if x.ndim != 2 or not x.is_contiguous() or not 0 < x.size(0) <= 4096:
             return False
@@ -271,15 +277,20 @@ class MoE(nn.Module):
     def _forward_compact_int4(self, x: torch.Tensor) -> torch.Tensor | None:
         """Route-major decode dispatch; larger batches keep the reference kernels.
 
-        For up to eight token rows the router slots are sorted by expert id once,
-        ``counts``/``offsets`` stay on the device, and the CUDA extension launches
-        one grid per projection, so no route value crosses to the host. Bigger
-        chunks use ``_forward_compact_host`` because their per-expert row count
-        exceeds the decode template and the existing MMA expert path is bitwise.
+        The router slots are sorted by expert id once, ``counts``/``offsets``
+        stay on the device, and the CUDA extension launches one grid per
+        projection, so no route value crosses to the host. GEMV handles 1-4
+        rows per expert; MMA8/16/32 handle 5-8, 9-16, and 17+ rows (MMA32
+        chunks), matching the reference's own dispatch split. Both the GEMV and
+        MMA templates fuse ``silu(gate)*up`` into the kernel, so the intermediate
+        is written once instead of twice plus an elementwise pass. Only chunks
+        above 4096 token rows use ``_forward_compact_host``.
         """
         T, k = x.size(0), self.top_k
-        if T > 8:
+        if T > 4096:
             return self._forward_compact_host(x)
+        fanout = self.cta_fanout or (8 if T <= 4 else 128 if T <= 8 else 64)
+        gemv_fanout = fanout if T <= 8 else 8
         top_vals, top_idx = self._route(x)
         idx_flat = top_idx.reshape(-1)
         if idx_flat.numel() == 0:
@@ -295,7 +306,9 @@ class MoE(nn.Module):
         offsets = torch.cumsum(counts, 0, dtype=torch.int32) - counts
         packed = x.index_select(0, target[order])
         rows = packed.size(0)
-        rows_cap = 1 if T <= 1 else 2 if T <= 2 else 4 if T <= 4 else 8
+        rows_cap = (1 if T <= 1 else 2 if T <= 2 else 4 if T <= 4
+                    else 8 if T <= 8 else 16 if T <= 16 else 32)
+        gemv_rows = T if T <= 8 else 4
         padded = packed.new_zeros((rows + rows_cap, x.size(1)))
         padded[:rows] = packed
         hidden = packed.new_zeros((rows + rows_cap, self.moe_intermediate_size))
@@ -307,8 +320,41 @@ class MoE(nn.Module):
         if not extension.expert_out_compact(
                 padded, tables["gate_w"], tables["gate_s"],
                 tables["up_w"], tables["up_s"], tables["down_w"], tables["down_s"],
-                offsets, counts, hidden, out, T, rows, group):
+                offsets, counts, hidden, out, gemv_rows, rows, group, gemv_fanout):
             return None
+        ranges = []
+        if T >= 5:
+            ranges.append((5, min(8, T), 8))
+        if T >= 9:
+            ranges.append((9, min(16, T), 16))
+        if T >= 17:
+            ranges.append((17, T, 32))
+        if ranges:
+            # The reference dispatches 5-8/9-16/17-32 rows to MMA8/16/32. Each
+            # compact range guards its own counts; the <=4-row GEMV result above
+            # stays untouched.
+            if self.fuse_int4_gate_up_silu:
+                # One buffer for silu(gate)*up: the MMA epilogue applies the
+                # activation, so gate/up are never written back and the
+                # intermediate is not recomputed by a separate elementwise pass.
+                for lo, hi, block_m in ranges:
+                    extension.gemm_gate_up_silu_compact(
+                        padded, tables["gate_w"], tables["gate_s"],
+                        tables["up_w"], tables["up_s"], offsets, counts,
+                        hidden, T, rows, group, fanout, block_m, lo, hi)
+            else:
+                gate_out = padded.new_empty((rows + rows_cap, self.moe_intermediate_size))
+                up_out = padded.new_empty((rows + rows_cap, self.moe_intermediate_size))
+                for lo, hi, block_m in ranges:
+                    extension.gemm_gate_up_out_compact(
+                        padded, tables["gate_w"], tables["gate_s"],
+                        tables["up_w"], tables["up_s"], offsets, counts,
+                        gate_out, up_out, T, rows, group, fanout, block_m, lo, hi)
+                hidden = F.silu(gate_out) * up_out
+            for lo, hi, block_m in ranges:
+                extension.gemm_out_compact(
+                    hidden, tables["down_w"], tables["down_s"], offsets, counts,
+                    out, T, rows, group, fanout, block_m, lo, hi)
         ys = out[:rows]
         inverse = torch.empty_like(order)
         inverse[order] = torch.arange(rows, device=x.device)

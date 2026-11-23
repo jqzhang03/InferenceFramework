@@ -132,13 +132,20 @@ and recompute on preemption.
 [DFlash comparison](benchmarks/_dflash_comparison_20261119.md) ·
 [DSpark comparison](benchmarks/_dspark_comparison_20261120.md).
 
-For pure INT4 MoE experts, `moe_int4_backend="loop|segment"` selects the per-expert or
-segmented GEMM path; `moe_int4_fuse_gate_up` controls gate/up launch fusion on the segmented
-path.
+For pure INT4 MoE experts, `moe_int4_backend="loop|segment|compact"` selects the per-expert,
+segmented Triton, or route-major CUDA W4A16 path; `moe_int4_fuse_gate_up` controls gate/up
+launch fusion on the segmented path, and `moe_int4_fuse_gate_up_silu` (default true) makes the
+compact 5+-row gate/up MMA epilogue write `silu(gate)*up` directly instead of two intermediates
+plus a torch elementwise. `compact` requires TP=1, the CUDA W4A16 backend and
+pure INT4 without `w_deq`/AWQ; decode batches of at most 8 rows avoid routed-expert
+D2H/sync, while larger prefill chunks fall back to host packing. The default remains `loop`.
+See [SiLU fusion](benchmarks/_deepseek_silu_fusion_20261123.md) for the bitwise checks and the
+measured kernel/end-to-end deltas.
 
 DeepSeek-V2-Lite defaults to native CUDA W4A16 for single-GPU INT4 inference with
 `int4_group_size=64` and the `loop` expert backend. Set `int4_kernel_backend="triton"`
-to run the Triton baseline. Weight quantization is enabled with `quantization="int4"`.
+to run the Triton baseline, or `moe_int4_backend="compact"` for the route-major decode
+path. Weight quantization is enabled with `quantization="int4"`.
 
 Speculative decoding on DeepSeek-V2-Lite is n-gram-only in practice. The MLA
 verify path is chain-only (`MLAAttention` assembles cache-shaped K/V; there is

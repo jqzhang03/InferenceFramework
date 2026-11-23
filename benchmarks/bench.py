@@ -374,6 +374,9 @@ def run_nanovllm(args, prompts, sampling_params):
               streaming_load=getattr(args, "streaming_load", False),
               int4_dense_path=not getattr(args, "no_int4_dense_path", False),
               int4_group_size=getattr(args, "int4_group_size", 128),
+              moe_int4_backend=getattr(args, "moe_int4_backend", "loop"),
+              moe_int4_cta_fanout=getattr(args, "moe_int4_cta_fanout", 0),
+              moe_int4_fuse_gate_up_silu=not getattr(args, "no_moe_int4_fuse_silu", False),
               kv_swap=not getattr(args, "no_swap_kv", False),
               kv_swap_space_gb=getattr(args, "kv_swap_space_gb", 2.0),
               mixed_cudagraph=not getattr(args, "no_mixed_cudagraph", False),
@@ -735,6 +738,13 @@ def parse_args():
                         "流式加载(7B+)自动强制关闭）")
     p.add_argument("--int4-group-size", type=int, default=128,
                    help="INT4 K 维分组大小；DeepSeek-V2-Lite 的 10944 维需设为 64")
+    p.add_argument("--moe-int4-backend", choices=("loop", "segment", "compact"),
+                   default="loop", help="DeepSeek INT4 MoE 实现；compact 需要纯 INT4")
+    p.add_argument("--moe-int4-cta-fanout", type=int, default=0,
+                   help="compact MoE 每 expert CTA 上限；0=按 T 自动")
+    p.add_argument("--no-moe-int4-fuse-silu", action="store_true",
+                   help="compact MoE 消融：5+ 行 gate/up MMA 不融合 SiLU，"
+                        "仍写回 gate/up 再由 torch 做 silu(gate)*up")
     p.add_argument("--no-swap-kv", action="store_true",
                    help="关闭KV swap抢占（KV块不足时回退重算 recompute 而非换出到CPU；"
                         "swap 支持 TP=1 的 auto 与 fp8_e4m3 KV；TP>1 时回退重算）")
@@ -879,6 +889,10 @@ def main():
             "tensor_parallel_size": args.tp,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "moe_int4_backend": getattr(args, "moe_int4_backend", "loop"),
+            "moe_int4_cta_fanout": getattr(args, "moe_int4_cta_fanout", 0),
+            "moe_int4_fuse_gate_up_silu": not getattr(
+                args, "no_moe_int4_fuse_silu", False),
         },
         "nanovllm": {"batches": [{k: v for k, v in b.items() if k != "per_request"} for b in batches],
                      "summary": make_summary(metrics), "per_request": metrics["per_request"],

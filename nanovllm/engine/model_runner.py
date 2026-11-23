@@ -1468,8 +1468,14 @@ class ModelRunner:
             bs = input_ids.size(0)
             # 获取全局上下文
             context = get_context()
-            # 复用固定batch_size的图
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            # 复用固定batch_size的图；compact 只为 T<=8 捕获，超出则 eager。
+            graph_bs = next((x for x in self.graph_bs if x >= bs), None)
+            if graph_bs is None:
+                self.decode_cudagraph_eager_fallbacks += 1
+                hidden = self.model(input_ids, positions)
+                logits = self.model.compute_logits(hidden)
+                return (logits, hidden) if return_hidden else logits
+            graph = self.graphs[graph_bs]
             # 获取图中使用的静态变量
             graph_vars = self.graph_vars
             # 将当前batch的input_ids拷贝至图张量的前bs个位置
@@ -1757,6 +1763,10 @@ class ModelRunner:
         outputs = torch.zeros(max_bs, hf_config.hidden_size)
         # 定义需要捕获的batch_size列表，初始时内存池为空
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        if self.config.moe_int4_backend == "compact":
+            # compact 的 decode 模板覆盖 T<=32；更大的 batch 会走 host 打包
+            # （.tolist()），不能进 graph，超过上限时 eager 回退。
+            self.graph_bs = [bs for bs in self.graph_bs if bs <= 32]
         self.graphs = {}
         self.graph_pool = None
 
