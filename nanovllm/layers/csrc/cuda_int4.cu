@@ -24,19 +24,6 @@ __device__ unsigned short from_float(float value) {
     else return __half_as_ushort(__float2half_rn(value));
 }
 
-template <bool BF16>
-__device__ uint4 dequantize(unsigned packed, float scale) {
-    uint4 weights;
-    auto* elements = reinterpret_cast<unsigned short*>(&weights);
-    #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        int signed_value = int(packed & 15) - 8;
-        elements[i] = from_float<BF16>(signed_value * scale);
-        packed >>= 4;
-    }
-    return weights;
-}
-
 // One eight-lane group owns one output column and reuses its weights over
 // the entire small batch. The final warp shuffles include boundary groups.
 struct PackedMatrix {
@@ -44,6 +31,46 @@ struct PackedMatrix {
     const unsigned short* scales;
     int group_size;
 };
+
+template <bool BF16>
+__device__ uint4 dequantize(unsigned packed, float scale) {
+    uint4 weights;
+    auto* elements = reinterpret_cast<unsigned short*>(&weights);
+    // Pair the eight scalar int4->float->bf16 conversions into four packed
+    // cvt.rn.bf16x2.f32 / cvt.rn.f16x2.f32 instructions. The low half still
+    // receives the lower nibble first, so every element and its rounding are
+    // identical to the scalar path.
+    #pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        const int low = int(packed & 15) - 8;
+        const int high = int((packed >> 4) & 15) - 8;
+        packed >>= 8;
+        const float f0 = low * scale;
+        const float f1 = high * scale;
+        if constexpr (BF16) {
+            *reinterpret_cast<__nv_bfloat162*>(elements + 2 * i) =
+                __floats2bfloat162_rn(f0, f1);
+        } else {
+            *reinterpret_cast<__half2*>(elements + 2 * i) =
+                __floats2half2_rn(f0, f1);
+        }
+    }
+    return weights;
+}
+
+// Raw packed word and scale, split out so gemv_columns can prefetch the next
+// K chunk before consuming the current dequantised tile.
+template <bool BF16>
+__device__ unsigned load_packed(PackedMatrix matrix, int col, int k, int kk) {
+    return *reinterpret_cast<const unsigned*>(
+        matrix.weights + int64_t(col) * (k / 2) + kk / 2);
+}
+
+template <bool BF16>
+__device__ float load_scale(PackedMatrix matrix, int col, int k, int kk) {
+    return to_float<BF16>(
+        matrix.scales[int64_t(col) * (k / matrix.group_size) + kk / matrix.group_size]);
+}
 
 template <bool BF16>
 __device__ uint4 load_weights(PackedMatrix matrix, int col, int k, int kk) {
@@ -72,10 +99,35 @@ __device__ void gemv_columns(const unsigned short* x, PackedMatrix weight, Packe
     float even[ROWS] = {}, odd[ROWS] = {};
     float up_even[ROWS] = {}, up_odd[ROWS] = {};
     if (col < n) {
-        for (int kk = lane * 8; kk < k; kk += lanes * 8) {
-            uint4 w = load_weights<BF16>(weight, col, k, kk);
+        constexpr int stride = lanes * 8;
+        int kk = lane * 8;
+        unsigned packed = 0, up_packed = 0;
+        float scale = 0.0f, up_scale = 0.0f;
+        if (kk < k) {
+            packed = load_packed<BF16>(weight, col, k, kk);
+            scale = load_scale<BF16>(weight, col, k, kk);
+            if constexpr (FUSED) {
+                up_packed = load_packed<BF16>(up, col, k, kk);
+                up_scale = load_scale<BF16>(up, col, k, kk);
+            }
+        }
+        for (; kk < k; kk += stride) {
+            // One K-chunk lookahead: the next packed word/scale is in flight
+            // while the current tile is dequantised and applied to all rows.
+            const int next = kk + stride;
+            unsigned next_packed = 0, next_up_packed = 0;
+            float next_scale = 0.0f, next_up_scale = 0.0f;
+            if (next < k) {
+                next_packed = load_packed<BF16>(weight, col, k, next);
+                next_scale = load_scale<BF16>(weight, col, k, next);
+                if constexpr (FUSED) {
+                    next_up_packed = load_packed<BF16>(up, col, k, next);
+                    next_up_scale = load_scale<BF16>(up, col, k, next);
+                }
+            }
+            uint4 w = dequantize<BF16>(packed, scale);
             uint4 u;
-            if constexpr (FUSED) u = load_weights<BF16>(up, col, k, kk);
+            if constexpr (FUSED) u = dequantize<BF16>(up_packed, up_scale);
             const auto* weights = reinterpret_cast<const unsigned short*>(&w);
             const auto* up_weights = reinterpret_cast<const unsigned short*>(&u);
             #pragma unroll
@@ -93,6 +145,10 @@ __device__ void gemv_columns(const unsigned short* x, PackedMatrix weight, Packe
                     }
                 }
             }
+            packed = next_packed;
+            scale = next_scale;
+            up_packed = next_up_packed;
+            up_scale = next_up_scale;
         }
     }
     #pragma unroll
@@ -221,23 +277,38 @@ __device__ int swizzled(int row, int k) {
     return row * block_k + (k ^ ((row % 8) * 8));
 }
 
-// Two warps own 16 output channels each. Compute W @ X^T so an eight-row
-// request tile fills the narrow MMA axis, then store X @ W^T in row-major.
-// Kept as a device function so the per-expert reference kernel and the
-// route-major compact kernel execute exactly the same arithmetic.
-template <bool BF16, int BLOCK_M>
+// Compute W @ X^T so an eight-row request tile fills the narrow MMA axis, then
+// store X @ W^T in row-major. Kept as a device function so the per-expert
+// reference kernel and the route-major compact kernel execute exactly the same
+// arithmetic.
+//
+// THREADS warps are grouped into `col_groups` channel pairs (16 channels each)
+// and `warps / col_groups` row groups. The output tile is block_n channels x
+// BLOCK_M rows either way; a wider CTA amortises the weight dequantisation over
+// more rows, and a narrower one keeps more CTAs resident.
+template <bool BF16, int BLOCK_M, int THREADS>
 __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
                          const unsigned short* scales, unsigned short* out,
                          int m, int n, int k, int group_size, int m0, int n0,
                          unsigned short* tile) {
-    constexpr int threads = 64;
+    constexpr int warps = THREADS / 32;
+    constexpr int col_groups = block_n / 16;
+    constexpr int row_groups = warps / col_groups;
+    constexpr int rows_per_warp = BLOCK_M / row_groups;
+    constexpr int row_tiles = rows_per_warp / 8;
+    static_assert(THREADS % 32 == 0 && warps % col_groups == 0,
+                  "mma_tile needs whole warp groups");
+    static_assert(row_groups >= 1 && rows_per_warp % 8 == 0 && row_tiles >= 1,
+                  "mma_tile needs at least one eight-row tile per warp");
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
+    const int col_group = warp % col_groups;
+    const int row_offset = (warp / col_groups) * rows_per_warp;
     const int groups = k / group_size;
-    float accum[BLOCK_M / 8][4] = {};
+    float accum[row_tiles][4] = {};
 
     for (int k0 = 0; k0 < k; k0 += block_k) {
         #pragma unroll
-        for (int index = threadIdx.x; index < block_n * (block_k / 8); index += threads) {
+        for (int index = threadIdx.x; index < block_n * (block_k / 8); index += THREADS) {
             const int row = index / (block_k / 8), col = (index % (block_k / 8)) * 8;
             const int channel = n0 + row, kk = k0 + col;
             uint4 values = {};
@@ -250,7 +321,7 @@ __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
             *reinterpret_cast<uint4*>(tile + swizzled(row, col)) = values;
         }
         #pragma unroll
-        for (int index = threadIdx.x; index < BLOCK_M * (block_k / 8); index += threads) {
+        for (int index = threadIdx.x; index < BLOCK_M * (block_k / 8); index += THREADS) {
             const int row = index / (block_k / 8), col = (index % (block_k / 8)) * 8;
             const int request = m0 + row, kk = k0 + col;
             uint4 values = {};
@@ -265,14 +336,15 @@ __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
         for (int kk = 0; kk < block_k; kk += 16) {
             unsigned a[4];
             unsigned address = __cvta_generic_to_shared(
-                tile + swizzled(warp * 16 + lane % 16, kk + (lane / 16) * 8));
+                tile + swizzled(col_group * 16 + lane % 16, kk + (lane / 16) * 8));
             asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
                          : "=r"(a[0]), "=r"(a[1]), "=r"(a[2]), "=r"(a[3]) : "r"(address));
             #pragma unroll
-            for (int r = 0; r < BLOCK_M / 8; ++r) {
+            for (int r = 0; r < row_tiles; ++r) {
                 unsigned b[2];
                 address = __cvta_generic_to_shared(
-                    tile + swizzled(block_n + r * 8 + lane % 8, kk + ((lane / 8) % 2) * 8));
+                    tile + swizzled(block_n + row_offset + r * 8 + lane % 8,
+                                    kk + ((lane / 8) % 2) * 8));
                 asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];"
                              : "=r"(b[0]), "=r"(b[1]) : "r"(address));
                 mma<BF16>(accum[r], a, b);
@@ -282,11 +354,11 @@ __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
     }
 
     #pragma unroll
-    for (int r = 0; r < BLOCK_M / 8; ++r) {
+    for (int r = 0; r < row_tiles; ++r) {
         #pragma unroll
         for (int i = 0; i < 4; ++i) {
-            const int col = n0 + warp * 16 + lane / 4 + (i / 2) * 8;
-            const int row = m0 + r * 8 + (lane % 4) * 2 + i % 2;
+            const int col = n0 + col_group * 16 + lane / 4 + (i / 2) * 8;
+            const int row = m0 + row_offset + r * 8 + (lane % 4) * 2 + i % 2;
             if (row < m && col < n) out[int64_t(row) * n + col] = from_float<BF16>(accum[r][i]);
         }
     }
@@ -549,14 +621,14 @@ __device__ void mma_gate_up_silu_wide_tile(const unsigned short* x,
     }
 }
 
-template <bool BF16, int BLOCK_M>
+template <bool BF16, int BLOCK_M, int THREADS = 64>
 __global__ void w4a16_mma_kernel(const unsigned short* x, const unsigned char* weights,
                                const unsigned short* scales, unsigned short* out,
                                int m, int n, int k, int group_size, int n_tiles) {
     __shared__ __align__(16) unsigned short tile[(block_n + BLOCK_M) * block_k];
     const int n0 = (blockIdx.x % n_tiles) * block_n;
     const int m0 = (blockIdx.x / n_tiles) * BLOCK_M;
-    mma_tile<BF16, BLOCK_M>(x, weights, scales, out, m, n, k, group_size, m0, n0, tile);
+    mma_tile<BF16, BLOCK_M, THREADS>(x, weights, scales, out, m, n, k, group_size, m0, n0, tile);
 }
 
 // Route-major MMA projection for experts whose segment has 5-8 rows. Experts
@@ -567,8 +639,7 @@ __global__ void w4a16_compact_mma_kernel(
         const unsigned short* x, const int64_t* weight_ptrs, const int64_t* scale_ptrs,
         const int* offsets, const int* counts, unsigned short* out,
         int n, int k, int group_size, int n_tiles, int min_count, int max_count) {
-    __shared__ __align__(16) unsigned short tile[(block_n + BLOCK_M) * block_k];
-    const int expert = blockIdx.x;
+    __shared__ __align__(16) unsigned short tile[(block_n + BLOCK_M) * block_k];    const int expert = blockIdx.x;
     const int total = counts[expert];
     if (total < min_count || total > max_count) return;
     const auto* weights = reinterpret_cast<const unsigned char*>(
@@ -582,9 +653,9 @@ __global__ void w4a16_compact_mma_kernel(
         for (int tile_index = blockIdx.z; tile_index < n_tiles;
              tile_index += gridDim.z) {
             const int n0 = tile_index * block_n;
-            mma_tile<BF16, BLOCK_M>(x + offset * k, weights, scales,
-                                    out + offset * n, rows, n, k, group_size,
-                                    0, n0, tile);
+            mma_tile<BF16, BLOCK_M, 64>(x + offset * k, weights, scales,
+                                        out + offset * n, rows, n, k, group_size,
+                                        0, n0, tile);
         }
     }
 }
@@ -674,15 +745,113 @@ __global__ void w4a16_compact_mma_gate_up_silu_kernel(
     }
 }
 
-template <bool BF16, int BLOCK_M>
+// 5-16 row band: one launch covers both the 5-8 and 9-16 row ranges and picks
+// the 8/16-row template from counts[expert]. The old dispatch issued two grids
+// per projection, and the 8-row grid carried an empty second chunk for every
+// expert below nine rows. BLOCK_M=16 is the largest template in this band, so
+// its shared tile bounds both branches.
+template <bool BF16>
+__global__ void w4a16_compact_mma_band_kernel(
+        const unsigned short* x, const int64_t* weight_ptrs, const int64_t* scale_ptrs,
+        const int* offsets, const int* counts, unsigned short* out,
+        int n, int k, int group_size, int n_tiles, int min_count, int max_count) {
+    __shared__ __align__(16) unsigned short tile[(block_n + 16) * block_k];
+    const int expert = blockIdx.x;
+    const int total = counts[expert];
+    if (total < min_count || total > max_count) return;
+    const auto* weights = reinterpret_cast<const unsigned char*>(
+        static_cast<uintptr_t>(weight_ptrs[expert]));
+    const auto* scales = reinterpret_cast<const unsigned short*>(
+        static_cast<uintptr_t>(scale_ptrs[expert]));
+    const int64_t offset = offsets[expert];
+    for (int tile_index = blockIdx.z; tile_index < n_tiles; tile_index += gridDim.z) {
+        const int n0 = tile_index * block_n;
+        if (total <= 8) {
+            mma_tile<BF16, 8, 64>(x + offset * k, weights, scales, out + offset * n,
+                                  total, n, k, group_size, 0, n0, tile);
+        } else {
+            mma_tile<BF16, 16, 64>(x + offset * k, weights, scales, out + offset * n,
+                                   total, n, k, group_size, 0, n0, tile);
+        }
+    }
+}
+
+template <bool BF16, bool FUSE_SILU>
+__global__ void __launch_bounds__(128, 8) w4a16_compact_mma_gate_up_band_kernel(
+        const unsigned short* x,
+        const int64_t* gate_w_ptrs, const int64_t* gate_s_ptrs,
+        const int64_t* up_w_ptrs, const int64_t* up_s_ptrs,
+        const int* offsets, const int* counts, unsigned short* gate_out,
+        unsigned short* up_out, int n, int k, int group_size, int n_tiles,
+        int min_count, int max_count) {
+    __shared__ __align__(16)
+        unsigned short tile[(2 * block_n + 16) * block_k];
+    __shared__ __align__(16) unsigned short gate_scratch[block_n * 16];
+    const int expert = blockIdx.x;
+    const int total = counts[expert];
+    if (total < min_count || total > max_count) return;
+    const auto* gate_w = reinterpret_cast<const unsigned char*>(
+        static_cast<uintptr_t>(gate_w_ptrs[expert]));
+    const auto* gate_s = reinterpret_cast<const unsigned short*>(
+        static_cast<uintptr_t>(gate_s_ptrs[expert]));
+    const auto* up_w = reinterpret_cast<const unsigned char*>(
+        static_cast<uintptr_t>(up_w_ptrs[expert]));
+    const auto* up_s = reinterpret_cast<const unsigned short*>(
+        static_cast<uintptr_t>(up_s_ptrs[expert]));
+    const int64_t offset = offsets[expert];
+    for (int tile_index = blockIdx.z; tile_index < n_tiles; tile_index += gridDim.z) {
+        const int n0 = tile_index * block_n;
+        if (total <= 8) {
+            mma_gate_up_tile<BF16, 8, FUSE_SILU>(
+                x + offset * k, gate_w, gate_s, up_w, up_s,
+                gate_out + offset * n, up_out == nullptr ? nullptr : up_out + offset * n,
+                total, n, k, group_size, 0, n0, tile, gate_scratch);
+        } else {
+            mma_gate_up_tile<BF16, 16, FUSE_SILU>(
+                x + offset * k, gate_w, gate_s, up_w, up_s,
+                gate_out + offset * n, up_out == nullptr ? nullptr : up_out + offset * n,
+                total, n, k, group_size, 0, n0, tile, gate_scratch);
+        }
+    }
+}
+
+template <bool BF16, int BLOCK_M, int THREADS>
 void launch_mma(const unsigned short* x, const unsigned char* w, const unsigned short* s,
                 unsigned short* out, int m, int n, int k, int group, cudaStream_t stream) {
     const int n_tiles = (n - 1) / 32 + 1;
     const int64_t ctas = int64_t(n_tiles) * ((m - 1) / BLOCK_M + 1);
     TORCH_CHECK(ctas <= std::numeric_limits<int>::max(), "W4A16 grid is too large");
-    w4a16_mma_kernel<BF16, BLOCK_M><<<ctas, 64, 0, stream>>>(x, w, s, out, m, n, k, group, n_tiles);
+    w4a16_mma_kernel<BF16, BLOCK_M, THREADS>
+        <<<ctas, THREADS, 0, stream>>>(x, w, s, out, m, n, k, group, n_tiles);
 }
 
+// Tile/warp variants for the dense INT4 projection. Variant 0 is the historical
+// two-warp, 32-row tile; the others widen the row tile so one weight
+// dequantisation feeds more rows (the kernel re-dequantises weights per CTA).
+template <bool BF16>
+void launch_mma_variant(int variant, const unsigned short* x, const unsigned char* w,
+                        const unsigned short* s, unsigned short* out, int m, int n,
+                        int k, int group, cudaStream_t stream) {
+    switch (variant) {
+        case 0: launch_mma<BF16, 32, 64>(x, w, s, out, m, n, k, group, stream); break;
+        case 1: launch_mma<BF16, 64, 128>(x, w, s, out, m, n, k, group, stream); break;
+        case 2: launch_mma<BF16, 128, 128>(x, w, s, out, m, n, k, group, stream); break;
+        case 3: launch_mma<BF16, 64, 64>(x, w, s, out, m, n, k, group, stream); break;
+        case 4: launch_mma<BF16, 128, 256>(x, w, s, out, m, n, k, group, stream); break;
+        case 5: launch_mma<BF16, 32, 128>(x, w, s, out, m, n, k, group, stream); break;
+        case 6: launch_mma<BF16, 256, 256>(x, w, s, out, m, n, k, group, stream); break;
+        case 7: launch_mma<BF16, 16, 128>(x, w, s, out, m, n, k, group, stream); break;
+        default: TORCH_CHECK(false, "unknown W4A16 MMA variant");
+    }
+}
+
+// Tile/warp schedule. The kernel re-dequantises the weight tile once per CTA,
+// so the row tile is chosen to amortise that over as many rows as possible
+// while keeping enough CTAs/warps resident. Measured on RTX 5060 Ti (layered
+// 27-layer pass, see benchmarks/int4_dense_tuning.py): 16 rows x 4 warps wins
+// for m<=64 (decode and small mixed batches), 32 x 4 warps for 65..160, and
+// 128 rows x 8 warps above that (prefill), where the dequantisation saving
+// dominates the lower CTA count.
 template <bool BF16>
 void launch(const unsigned short* x, const unsigned char* w, const unsigned short* s,
             unsigned short* out, int m, int n, int k, int group, cudaStream_t stream) {
@@ -694,12 +863,12 @@ void launch(const unsigned short* x, const unsigned char* w, const unsigned shor
             case 3: w4a16_gemv_kernel<BF16, 3><<<grid, 128, 0, stream>>>(x, w, s, out, n, k, group, 3); break;
             case 4: w4a16_gemv_kernel<BF16, 4><<<grid, 128, 0, stream>>>(x, w, s, out, n, k, group, 4); break;
         }
-    } else if (m <= 8) {
-        launch_mma<BF16, 8>(x, w, s, out, m, n, k, group, stream);
-    } else if (m <= 16) {
-        launch_mma<BF16, 16>(x, w, s, out, m, n, k, group, stream);
+    } else if (m <= 64) {
+        launch_mma<BF16, 16, 128>(x, w, s, out, m, n, k, group, stream);
+    } else if (m <= 160) {
+        launch_mma<BF16, 32, 128>(x, w, s, out, m, n, k, group, stream);
     } else {
-        launch_mma<BF16, 32>(x, w, s, out, m, n, k, group, stream);
+        launch_mma<BF16, 128, 256>(x, w, s, out, m, n, k, group, stream);
     }
 }
 
@@ -742,6 +911,26 @@ void gemm_out(const at::Tensor& x, const at::Tensor& packed, const at::Tensor& s
         launch<true>(a, matrix.weights, matrix.scales, c, m, n, k, matrix.group_size, stream);
     else
         launch<false>(a, matrix.weights, matrix.scales, c, m, n, k, matrix.group_size, stream);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// Diagnostic entry point: same layouts as gemm_out but a fixed MMA tile/warp
+// variant, so benchmarks can screen tile shapes without rebuilding the engine.
+void gemm_out_variant(const at::Tensor& x, const at::Tensor& packed,
+                      const at::Tensor& scales, at::Tensor& out, int64_t variant) {
+    const PackedMatrix matrix = checked_matrix(x, packed, scales, out);
+    const int m = x.size(0), k = x.size(1), n = packed.size(0);
+    if (m == 0 || n == 0) return;
+    const c10::cuda::CUDAGuard guard(x.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+    const auto* a = reinterpret_cast<const unsigned short*>(x.data_ptr());
+    auto* c = reinterpret_cast<unsigned short*>(out.data_ptr());
+    if (x.scalar_type() == at::kBFloat16)
+        launch_mma_variant<true>(static_cast<int>(variant), a, matrix.weights,
+                                 matrix.scales, c, m, n, k, matrix.group_size, stream);
+    else
+        launch_mma_variant<false>(static_cast<int>(variant), a, matrix.weights,
+                                  matrix.scales, c, m, n, k, matrix.group_size, stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -807,13 +996,14 @@ void launch_compact(const unsigned short* x,
                     const int* offsets, const int* counts, unsigned short* hidden,
                     unsigned short* out, int experts, int max_rows, int width,
                     int intermediate, int group_size, int cta_fanout,
-                    cudaStream_t stream) {
+                    int gate_fanout, cudaStream_t stream) {
     const int gate_tiles = (intermediate - 1) / 16 + 1;
     const int down_tiles = (width - 1) / 16 + 1;
     const int chunks = (max_rows + ROWS - 1) / ROWS;
-    // Decode experts are tiny; cap the per-expert CTA fan-out so empty experts
-    // do not launch the full 88/128-tile grid. Each CTA strides over the rest.
-    const int gate_ctas = std::min(gate_tiles, cta_fanout);
+    // Gate/up reuses its activation across four lane groups and prefers the
+    // narrower grid; down is the larger K/column sweep and benefits from the
+    // full fan-out. Empty experts still exit at the count guard.
+    const int gate_ctas = std::min(gate_tiles, gate_fanout);
     const int down_ctas = std::min(down_tiles, cta_fanout);
     const dim3 gate_grid(experts, chunks, gate_ctas);
     const dim3 down_grid(experts, chunks, down_ctas);
@@ -833,24 +1023,24 @@ void launch_compact_rows(int rows_cap, const unsigned short* x,
                          const int* offsets, const int* counts, unsigned short* hidden,
                          unsigned short* out, int experts, int max_rows, int width,
                          int intermediate, int group_size, int cta_fanout,
-                         cudaStream_t stream) {
+                         int gate_fanout, cudaStream_t stream) {
     switch (rows_cap) {
         case 1: launch_compact<BF16, 1>(x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs,
                                         down_w_ptrs, down_s_ptrs, offsets, counts, hidden,
                                         out, experts, max_rows, width, intermediate,
-                                        group_size, cta_fanout, stream); break;
+                                        group_size, cta_fanout, gate_fanout, stream); break;
         case 2: launch_compact<BF16, 2>(x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs,
                                         down_w_ptrs, down_s_ptrs, offsets, counts, hidden,
                                         out, experts, max_rows, width, intermediate,
-                                        group_size, cta_fanout, stream); break;
+                                        group_size, cta_fanout, gate_fanout, stream); break;
         case 4: launch_compact<BF16, 4>(x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs,
                                         down_w_ptrs, down_s_ptrs, offsets, counts, hidden,
                                         out, experts, max_rows, width, intermediate,
-                                        group_size, cta_fanout, stream); break;
+                                        group_size, cta_fanout, gate_fanout, stream); break;
         case 8: launch_compact<BF16, 8>(x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs,
                                         down_w_ptrs, down_s_ptrs, offsets, counts, hidden,
                                         out, experts, max_rows, width, intermediate,
-                                        group_size, cta_fanout, stream); break;
+                                        group_size, cta_fanout, gate_fanout, stream); break;
     }
 }
 
@@ -939,6 +1129,9 @@ void launch_compact_mma_gate_up_silu_block(
         const int64_t* up_s_ptrs, const int* offsets, const int* counts,
         unsigned short* hidden, int experts, int n, int k, int group_size,
         int cta_fanout, int min_count, int max_count, cudaStream_t stream) {
+    // Four row chunks per expert/channel tile is the measured optimum: one/two
+    // chunks serialized too much work per CTA and lost more occupancy than the
+    // repeated weight/activation reads saved. Kept as the baseline schedule.
     const int chunks = std::min((max_count + BLOCK_M - 1) / BLOCK_M, 4);
     const int n_tiles = (n + block_n - 1) / block_n;
     const int ctas = std::min(n_tiles, cta_fanout);
@@ -973,6 +1166,51 @@ void launch_compact_mma_gate_up_silu(
     }
 }
 
+template <bool BF16>
+void launch_compact_mma_band(const unsigned short* x, const int64_t* weight_ptrs,
+                             const int64_t* scale_ptrs, const int* offsets,
+                             const int* counts, unsigned short* out, int experts,
+                             int n, int k, int group_size, int cta_fanout,
+                             int min_count, int max_count, cudaStream_t stream) {
+    const int n_tiles = (n + block_n - 1) / block_n;
+    const int ctas = std::min(n_tiles, cta_fanout);
+    const dim3 grid(experts, 1, ctas);
+    w4a16_compact_mma_band_kernel<BF16><<<grid, 64, 0, stream>>>(
+        x, weight_ptrs, scale_ptrs, offsets, counts, out, n, k, group_size,
+        n_tiles, min_count, max_count);
+}
+
+template <bool BF16>
+void launch_compact_mma_gate_up_band(
+        const unsigned short* x, const int64_t* gate_w_ptrs,
+        const int64_t* gate_s_ptrs, const int64_t* up_w_ptrs,
+        const int64_t* up_s_ptrs, const int* offsets, const int* counts,
+        unsigned short* gate_out, unsigned short* up_out, int experts, int n,
+        int k, int group_size, int cta_fanout, int min_count, int max_count,
+        cudaStream_t stream) {
+    const int n_tiles = (n + block_n - 1) / block_n;
+    const int ctas = std::min(n_tiles, cta_fanout);
+    const dim3 grid(experts, 1, ctas);
+    w4a16_compact_mma_gate_up_band_kernel<BF16, false><<<grid, 128, 0, stream>>>(
+        x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs, offsets, counts,
+        gate_out, up_out, n, k, group_size, n_tiles, min_count, max_count);
+}
+
+template <bool BF16>
+void launch_compact_mma_gate_up_silu_band(
+        const unsigned short* x, const int64_t* gate_w_ptrs,
+        const int64_t* gate_s_ptrs, const int64_t* up_w_ptrs,
+        const int64_t* up_s_ptrs, const int* offsets, const int* counts,
+        unsigned short* hidden, int experts, int n, int k, int group_size,
+        int cta_fanout, int min_count, int max_count, cudaStream_t stream) {
+    const int n_tiles = (n + block_n - 1) / block_n;
+    const int ctas = std::min(n_tiles, cta_fanout);
+    const dim3 grid(experts, 1, ctas);
+    w4a16_compact_mma_gate_up_band_kernel<BF16, true><<<grid, 128, 0, stream>>>(
+        x, gate_w_ptrs, gate_s_ptrs, up_w_ptrs, up_s_ptrs, offsets, counts,
+        hidden, nullptr, n, k, group_size, n_tiles, min_count, max_count);
+}
+
 bool gemm_out_compact(const at::Tensor& x, const at::Tensor& weight_ptrs,
                       const at::Tensor& scale_ptrs, const at::Tensor& offsets,
                       const at::Tensor& counts, at::Tensor& out,
@@ -1004,13 +1242,14 @@ bool gemm_out_compact(const at::Tensor& x, const at::Tensor& weight_ptrs,
     const int k = x.size(1);
     const int n = out.size(1);
     const int block = static_cast<int>(block_m);
+    const int padding = block == 0 ? std::min(16, static_cast<int>(max_rows)) : block;
     const int lo = static_cast<int>(min_count);
     const int hi = static_cast<int>(max_count);
     TORCH_CHECK(max_rows > 0 && max_rows <= 16384 &&
-                (block == 8 || block == 16 || block == 32) &&
+                (block == 0 || block == 8 || block == 16 || block == 32) &&
                 lo >= 1 && lo <= hi && hi <= max_rows &&
                 rows >= 0 && rows <= x.size(0) &&
-                out.size(0) >= rows + block && x.size(0) >= rows + block,
+                out.size(0) >= rows + padding && x.size(0) >= rows + padding,
                 "invalid compact W4A16 MMA row range");
     const int group = static_cast<int>(group_size);
     TORCH_CHECK(group >= 8 && 128 % group == 0 && k % group == 0,
@@ -1024,7 +1263,16 @@ bool gemm_out_compact(const at::Tensor& x, const at::Tensor& weight_ptrs,
     const auto* scale = scale_ptrs.data_ptr<int64_t>();
     const auto* offsets_ptr = offsets.data_ptr<int>();
     const auto* counts_ptr = counts.data_ptr<int>();
-    if (type == at::kBFloat16)
+    if (block == 0) {
+        if (type == at::kBFloat16)
+            launch_compact_mma_band<true>(x_ptr, weight, scale, offsets_ptr, counts_ptr,
+                                          out_ptr, experts, n, k, group,
+                                          static_cast<int>(cta_fanout), lo, hi, stream);
+        else
+            launch_compact_mma_band<false>(x_ptr, weight, scale, offsets_ptr, counts_ptr,
+                                           out_ptr, experts, n, k, group,
+                                           static_cast<int>(cta_fanout), lo, hi, stream);
+    } else if (type == at::kBFloat16)
         launch_compact_mma<true>(x_ptr, weight, scale, offsets_ptr, counts_ptr, out_ptr,
                                  experts, block, n, k, group,
                                  static_cast<int>(cta_fanout), lo, hi, stream);
@@ -1073,14 +1321,15 @@ bool gemm_gate_up_out_compact(
     const int k = x.size(1);
     const int n = gate_out.size(1);
     const int block = static_cast<int>(block_m);
+    const int padding = block == 0 ? std::min(16, static_cast<int>(max_rows)) : block;
     const int lo = static_cast<int>(min_count);
     const int hi = static_cast<int>(max_count);
     TORCH_CHECK(max_rows > 0 && max_rows <= 16384 &&
-                (block == 8 || block == 16 || block == 32) &&
+                (block == 0 || block == 8 || block == 16 || block == 32) &&
                 lo >= 1 && lo <= hi && hi <= max_rows &&
                 rows >= 0 && rows <= x.size(0) &&
-                gate_out.size(0) >= rows + block &&
-                up_out.size(0) >= rows + block && x.size(0) >= rows + block,
+                gate_out.size(0) >= rows + padding &&
+                up_out.size(0) >= rows + padding && x.size(0) >= rows + padding,
                 "invalid compact W4A16 gate/up row range");
     const int group = static_cast<int>(group_size);
     TORCH_CHECK(group >= 8 && 128 % group == 0 && k % group == 0,
@@ -1097,7 +1346,18 @@ bool gemm_gate_up_out_compact(
     const auto* up_s = up_s_ptrs.data_ptr<int64_t>();
     const auto* offsets_ptr = offsets.data_ptr<int>();
     const auto* counts_ptr = counts.data_ptr<int>();
-    if (type == at::kBFloat16)
+    if (block == 0) {
+        if (type == at::kBFloat16)
+            launch_compact_mma_gate_up_band<true>(
+                x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
+                gate_ptr, up_ptr, experts, n, k, group,
+                static_cast<int>(cta_fanout), lo, hi, stream);
+        else
+            launch_compact_mma_gate_up_band<false>(
+                x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
+                gate_ptr, up_ptr, experts, n, k, group,
+                static_cast<int>(cta_fanout), lo, hi, stream);
+    } else if (type == at::kBFloat16)
         launch_compact_mma_gate_up<true>(
             x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
             gate_ptr, up_ptr, experts, block, n, k, group,
@@ -1150,13 +1410,14 @@ bool gemm_gate_up_silu_compact(
     const int k = x.size(1);
     const int n = hidden.size(1);
     const int block = static_cast<int>(block_m);
+    const int padding = block == 0 ? std::min(16, static_cast<int>(max_rows)) : block;
     const int lo = static_cast<int>(min_count);
     const int hi = static_cast<int>(max_count);
     TORCH_CHECK(max_rows > 0 && max_rows <= 16384 &&
-                (block == 8 || block == 16 || block == 32) &&
+                (block == 0 || block == 8 || block == 16 || block == 32) &&
                 lo >= 1 && lo <= hi && hi <= max_rows &&
                 rows >= 0 && rows <= x.size(0) &&
-                hidden.size(0) >= rows + block && x.size(0) >= rows + block,
+                hidden.size(0) >= rows + padding && x.size(0) >= rows + padding,
                 "invalid compact W4A16 fused gate/up row range");
     const int group = static_cast<int>(group_size);
     TORCH_CHECK(group >= 8 && 128 % group == 0 && k % group == 0,
@@ -1173,7 +1434,18 @@ bool gemm_gate_up_silu_compact(
     const auto* up_s = up_s_ptrs.data_ptr<int64_t>();
     const auto* offsets_ptr = offsets.data_ptr<int>();
     const auto* counts_ptr = counts.data_ptr<int>();
-    if (type == at::kBFloat16)
+    if (block == 0) {
+        if (type == at::kBFloat16)
+            launch_compact_mma_gate_up_silu_band<true>(
+                x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
+                hidden_ptr, experts, n, k, group,
+                static_cast<int>(cta_fanout), lo, hi, stream);
+        else
+            launch_compact_mma_gate_up_silu_band<false>(
+                x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
+                hidden_ptr, experts, n, k, group,
+                static_cast<int>(cta_fanout), lo, hi, stream);
+    } else if (type == at::kBFloat16)
         launch_compact_mma_gate_up_silu<true>(
             x_ptr, gate_w, gate_s, up_w, up_s, offsets_ptr, counts_ptr,
             hidden_ptr, experts, block, n, k, group,
@@ -1193,7 +1465,8 @@ bool expert_out_compact(const at::Tensor& x,
                         const at::Tensor& down_w_ptrs, const at::Tensor& down_s_ptrs,
                         const at::Tensor& offsets, const at::Tensor& counts,
                         at::Tensor& hidden, at::Tensor& out, int64_t max_rows,
-                        int64_t logical_rows, int64_t group_size, int64_t cta_fanout) {
+                        int64_t logical_rows, int64_t group_size, int64_t cta_fanout,
+                        int64_t gate_fanout) {
     TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.is_contiguous(),
                 "compact W4A16 expects contiguous rank-two CUDA activations");
     TORCH_CHECK(hidden.is_cuda() && hidden.dim() == 2 && hidden.is_contiguous() &&
@@ -1237,6 +1510,7 @@ bool expert_out_compact(const at::Tensor& x,
                 width % group == 0 && intermediate % group == 0,
                 "invalid compact W4A16 INT4 group size");
     TORCH_CHECK(cta_fanout >= 1, "compact W4A16 CTA fan-out must be positive");
+    TORCH_CHECK(gate_fanout >= 1, "compact W4A16 gate fan-out must be positive");
     const c10::cuda::CUDAGuard guard(x.device());
     const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
     const auto* x_ptr = reinterpret_cast<const unsigned short*>(x.data_ptr());
@@ -1254,12 +1528,14 @@ bool expert_out_compact(const at::Tensor& x,
         launch_compact_rows<true>(rows_cap, x_ptr, gate_w, gate_s, up_w, up_s,
                                   down_w, down_s, offsets_ptr, counts_ptr, hidden_ptr,
                                   out_ptr, experts, static_cast<int>(max_rows), width,
-                                  intermediate, group, static_cast<int>(cta_fanout), stream);
+                                  intermediate, group, static_cast<int>(cta_fanout),
+                                  static_cast<int>(gate_fanout), stream);
     else
         launch_compact_rows<false>(rows_cap, x_ptr, gate_w, gate_s, up_w, up_s,
                                    down_w, down_s, offsets_ptr, counts_ptr, hidden_ptr,
                                    out_ptr, experts, static_cast<int>(max_rows), width,
-                                   intermediate, group, static_cast<int>(cta_fanout), stream);
+                                   intermediate, group, static_cast<int>(cta_fanout),
+                                   static_cast<int>(gate_fanout), stream);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
     return true;
 }
@@ -1284,6 +1560,8 @@ bool expert_out(const at::Tensor& x, const at::Tensor& gate_weight, const at::Te
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("gemm_out", &gemm_out, "Fused packed-INT4 x FP16/BF16 GEMM");
+    module.def("gemm_out_variant", &gemm_out_variant,
+               "Diagnostic packed-INT4 GEMM with an explicit MMA tile variant");
     module.def("expert_out", &expert_out, "Fused packed-INT4 expert FFN for M1-4");
     module.def("expert_out_compact", &expert_out_compact,
                "Route-major packed-INT4 expert FFN with device offsets");

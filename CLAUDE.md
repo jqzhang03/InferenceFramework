@@ -75,6 +75,39 @@ weight-streaming bound, so the end-to-end gain is small. See
 `benchmarks/_deepseek_silu_fusion_20261123.md` and
 `benchmarks/compact_silu_fusion.py`.
 
+Prefix-cache-hit prefill (2026-11-23): `benchmarks/bench.py --warmup-passes`
+(default 2) warms the real prompts twice so the second pass hits the prefix
+cache built by the first and compiles the cache-shaped prefill path before
+timing; `nsys_profile.py --warmup-prefix-hits` does the same for captures
+(opt-in; the default still captures a full cold prefill). Verification found
+`MLAAttention._assemble` reading five host scalars per row per layer: one
+cache-hit prefill issued 4,213 4-byte D2H copies with a stream sync each
+(473.6 ms CPU, 310 ms GPU idle), which made the hit prefill slower than a full
+cold prefill. It now builds the segment/row indices on the device
+(`repeat_interleave` + `where` + one `cat`/`index_select`) and keeps a single
+`.item()` for the output row count; a CPU test compares it bitwise against the
+old row loop. Cold-cache ShareGPT: TTFT 862.8 → 705.0 ms from the warmup alone
+and 582.6 ms with the assemble fix (−32.5%), steady prefill 0.727 → 0.515 s,
+decode TPOT unchanged; nsys prefill gap 310 → 171 ms and 4,213 → 82 tiny D2H.
+See `benchmarks/_deepseek_cache_hit_prefill_20261123.md`.
+
+Dense INT4 projection tiles (2026-11-23): the 175.9 ms `w4a16_mma_kernel` in the
+nsys ShareGPT prefill is not just the MLP — it is every non-routed INT4 linear
+(27 layers × MLA q_a/q_b/kv_a/kv_b/o + dense/shared gate_up/down = 189 launches).
+`mma_tile` now takes a `THREADS` template parameter (warp groups split channels
+and rows) and `launch()` picks the tile from m: ≤4 GEMV, 5–64 rows 16×128
+threads, 65–160 rows 32×128, >160 rows 128×256, because the kernel re-dequantises
+its weight tile once per CTA (32×64 threads duplicated that up to 56× for
+prefill M). All variants keep the per-output MMA K order and are bitwise
+identical to the old tile. Layered microbench (27 layers × 7 real shapes with
+distinct weights): M=1257 108.9 → 65.4 ms, M=1769 147.3 → 86.9 ms (‑40%),
+M=32 decode 20.1 → 8.5 ms (‑58%). Nsys cache-hit prefill: the kernel
+120.5 → 76.4 ms, prefill wall 634.6 → 510.3 ms; ShareGPT TTFT 582.6 → 496.8 ms
+and TPOT 110.7 → 100.6 ms; graph decode b8/b16/b32 TPOT −8.8/−8.0/−7.5% (b1/b4
+stay on GEMV, ±3% noise), tokens unchanged. `gemm_out_variant` remains as the
+diagnostic tile entry; see `benchmarks/int4_dense_tuning.py` and
+`benchmarks/_deepseek_dense_tiles_20261123.md`. Tests: 120 passed.
+
 Warp GEMV follow-up (2026-11-17): --warp-gemv-study --output <fresh-dir> and
 --warp-gemv-pytest cover M1-4 Decode38–49 (warp/subwarp-owned outputs, register
 weight reuse, shuffle reduction, no shared/CTA barrier). Bundled cuda_decode

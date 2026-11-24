@@ -127,3 +127,77 @@ def test_routed_scaling_factor():
     y1r = m1.reference(x)
     assert torch.allclose(y1, y1r, atol=1e-5)
     assert not torch.allclose(y1, y2, atol=1e-3), "factor=2 应改变输出"
+
+
+def _row_loop_assemble(attn, k_dense, v_dense, starts, qlens, q_off, gather_idx):
+    """旧版逐行组装（5 次 host int()/行）；仅作为 `_assemble` 的位级参考。"""
+    flat = attn.mla_cache.reshape(-1, attn.mla_cache.shape[-1])
+    gathered = flat.index_select(0, gather_idx.long())
+    gc, gk = gathered.split([attn.kv_lora_rank, attn.qk_rope_head_dim], dim=-1)
+    gk_head, gv = attn._expand(gc, gk, gc.shape[0])
+    s, f = starts.long(), qlens.long()
+    total = int((s + f).sum())
+    k_out = torch.empty(total, *gk_head.shape[1:], dtype=k_dense.dtype)
+    v_out = torch.empty(total, *gv.shape[1:], dtype=v_dense.dtype)
+    seg_start = torch.cat([torch.zeros(1, dtype=torch.long),
+                           torch.cumsum(s + f, 0)[:-1]])
+    s_cum = torch.cat([torch.zeros(1, dtype=torch.long), torch.cumsum(s, 0)])
+    for r in range(s.numel()):
+        dst = int(seg_start[r])
+        cs, ce = int(s_cum[r]), int(s_cum[r + 1])
+        qs = int(q_off[r])
+        qe = qs + int(f[r])
+        if ce - cs:
+            k_out[dst:dst + ce - cs] = gk_head[cs:ce]
+            v_out[dst:dst + ce - cs] = gv[cs:ce]
+        if qe - qs:
+            k_out[dst + ce - cs:dst + ce - cs + qe - qs] = k_dense[qs:qe]
+            v_out[dst + ce - cs:dst + ce - cs + qe - qs] = v_dense[qs:qe]
+    return k_out, v_out
+
+
+def test_mla_cache_assemble_matches_row_loop():
+    """向量化 `_assemble` 与旧逐行循环位级相同（cache-shaped prefill / decode 兜底）。
+
+    旧实现每行读 5 个 host 标量，cache 命中 prefill 会变成 4,160 次 4B D2H + sync
+    （RTX 5060 Ti 上 310 ms GPU 空转），这里锁住替换后的数值语义。
+    """
+    torch.manual_seed(4)
+    cfg = _toy_cfg()
+    m = DeepseekV2ForCausalLM(cfg)
+    attn = m.model.layers[0].self_attn
+    blocks, block_size = 8, 16
+    dim = attn.kv_lora_rank + attn.qk_rope_head_dim
+    attn.mla_cache = torch.randn(blocks, block_size, dim)
+    attn.mla_fp8 = False
+    heads = attn.num_heads
+    dk = attn.qk_nope_head_dim + attn.qk_rope_head_dim
+    dv = attn.v_head_dim
+
+    # 1) cache-shaped prefill：部分行有前缀（start>0），部分行 start=0
+    starts = torch.tensor([0, 3, 0, 5, 2], dtype=torch.int32)
+    qlens = torch.tensor([2, 4, 1, 2, 3], dtype=torch.int32)
+    tokens = int(qlens.sum())
+    q_off = torch.cat([torch.zeros(1, dtype=torch.int32),
+                       torch.cumsum(qlens, 0)[:-1]])
+    gather = torch.randint(0, blocks * block_size, (int(starts.sum()),),
+                           dtype=torch.long)
+    k_dense = torch.randn(tokens, heads, dk)
+    v_dense = torch.randn(tokens, heads, dv)
+    with torch.no_grad():
+        got = attn._assemble(k_dense, v_dense, starts, qlens, q_off, gather)
+        want = _row_loop_assemble(attn, k_dense, v_dense, starts, qlens, q_off, gather)
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])
+
+    # 2) decode 兜底：qlens 全 0、fresh 段传 [0,1,1] 空张量
+    starts = torch.tensor([5, 2, 7], dtype=torch.int32)
+    qlens = torch.zeros(3, dtype=torch.int32)
+    q_off = torch.zeros(3, dtype=torch.int32)
+    gather = torch.randint(0, blocks * block_size, (int(starts.sum()),),
+                           dtype=torch.long)
+    q = torch.randn(3, heads, dk)
+    with torch.no_grad():
+        got = attn._assemble(q, q.new_empty(0, 1, 1), starts, qlens, q_off, gather)
+        want = _row_loop_assemble(attn, q, q.new_empty(0, heads, dv),
+                                  starts, qlens, q_off, gather)
+    assert torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])

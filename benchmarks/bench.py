@@ -386,9 +386,15 @@ def run_nanovllm(args, prompts, sampling_params):
               **scheduler_options(args))
     # 预热：触发torch.compile/triton的JIT编译、分配KV Cache、捕获CUDA Graph。
     # 用真实 workload prompts（而非 3-token 的 "warm up"）——fp8 的融合量化/硬件MMA
-    # 内核按 K 形状一次性 JIT 编译（~100-400ms），必须落在预热里而不是计时区间
-    llm.generate(prompts[: min(args.warmup_seqs, len(prompts))],
-                 SamplingParams(temperature=0.6, max_tokens=8), use_tqdm=False)
+    # 内核按 K 形状一次性 JIT 编译（~100-400ms），必须落在预热里而不是计时区间。
+    # 第一次 pass 前缀缓存为空；第二次 pass 命中第一次建立的 prefix cache，从而在
+    # 计时前编译“prefix-cache 命中后的 prefill 形状”（query span < key span，K/V
+    # 直接取分页 cache）。只跑一次时这段 lazy 编译会落进首个计时 batch 的 TTFT
+    # （冷启动 1.86 s vs 稳态 0.92 s 的来源，见 benchmarks/_deepseek_sharegpt_final_perf_20261123.md）。
+    warmup_prompts = prompts[: min(args.warmup_seqs, len(prompts))]
+    warmup_params = SamplingParams(temperature=0.6, max_tokens=8, ignore_eos=True)
+    for _ in range(args.warmup_passes):
+        llm.generate(warmup_prompts, warmup_params, use_tqdm=False)
     batches = []
     for i in range(args.repeat_batches):
         t0 = time.perf_counter()
@@ -805,6 +811,10 @@ def parse_args():
     p.add_argument("--max-model-len", type=int, default=4096)
     p.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     p.add_argument("--warmup-seqs", type=int, default=8)
+    p.add_argument("--warmup-passes", type=int, default=2,
+                   help="对真实 workload prompts 的预热轮数；>=2 时第二轮命中第一轮建立的 "
+                        "prefix cache，把 cache 命中后的 prefill 形状也在计时前编译掉。"
+                        "0=不预热，1=旧行为（首个计时 batch 会带上 cache 命中形状的 lazy 编译）")
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--slo-ttft-ms", type=float, default=500.0)
     p.add_argument("--slo-tpot-ms", type=float, default=10.0)
@@ -818,6 +828,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.warmup_passes < 0:
+        raise ValueError("--warmup-passes must be non-negative")
     args.model = os.path.expanduser(args.model)  # bash argv 不展开 ~ → 手动展开
     from transformers import AutoTokenizer
     tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True) if args.prompts_file else None
@@ -889,6 +901,8 @@ def main():
             "tensor_parallel_size": args.tp,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
+            "warmup_seqs": args.warmup_seqs,
+            "warmup_passes": args.warmup_passes,
             "moe_int4_backend": getattr(args, "moe_int4_backend", "loop"),
             "moe_int4_cta_fanout": getattr(args, "moe_int4_cta_fanout", 0),
             "moe_int4_fuse_gate_up_silu": not getattr(

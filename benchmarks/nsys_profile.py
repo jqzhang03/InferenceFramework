@@ -299,6 +299,11 @@ def _parse_args() -> argparse.Namespace:
                         help="enable decode CUDA graph instead of forced eager")
     parser.add_argument("--warmup-seqs", type=int, default=8,
                         help="number of shape-matched warmup requests; 0 uses all")
+    parser.add_argument("--warmup-prefix-hits", action="store_true",
+                        help="after the shifted-token warmup, run the captured prompts twice so the "
+                             "prefix-cache-hit prefill shape (query span < key span) is compiled "
+                             "before capture; the capture then sees the same 512-token cache hits "
+                             "as benchmarks/bench.py instead of a full cold prefill")
     parser.add_argument("--gpu-event-json", default="profiles/nsys_gpu_event_summary.json",
                         help="write per-module CUDA Event timings to this JSON file")
     parser.add_argument("--seed", type=int, default=0)
@@ -306,7 +311,7 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _warmup(engine: LLM, prompts: list[list[int]], sampling_params: list[SamplingParams],
-            count: int) -> None:
+            count: int, prefix_hits: bool = False) -> None:
     if count == 0:
         return
     count = min(count, len(prompts))
@@ -318,9 +323,18 @@ def _warmup(engine: LLM, prompts: list[list[int]], sampling_params: list[Samplin
         ignore_eos=True,
         max_tokens=min(2, params.max_tokens),
     ) for params in sampling_params[:count]]
-    print(f"[nsys] warmup requests={count}; inference capture starts afterward",
-          flush=True)
+    print(f"[nsys] warmup requests={count}; prefix_hits={prefix_hits}; "
+          f"inference capture starts afterward", flush=True)
     engine.generate(warmup_prompts, warmup_params, use_tqdm=False)
+    if prefix_hits:
+        # The shifted pass above warms the cold-prefill shapes without leaving a
+        # usable prefix for the captured prompts. These two real-prompt passes
+        # mirror benchmarks/bench.py: the first fills the prefix cache, the
+        # second compiles the cache-hit prefill path and leaves the cache in the
+        # state the capture will see (512 hit tokens on the ShareGPT trace).
+        real_prompts = prompts[:count]
+        for _ in range(2):
+            engine.generate(real_prompts, warmup_params, use_tqdm=False)
     torch.cuda.synchronize()
 
 
@@ -359,7 +373,8 @@ def main() -> None:
     )
     tokenizer = engine.tokenizer if args.prompts_file else None
     prompts, sampling_params = build_workload(args, tokenizer)
-    _warmup(engine, prompts, sampling_params, args.warmup_seqs)
+    _warmup(engine, prompts, sampling_params, args.warmup_seqs,
+            prefix_hits=args.warmup_prefix_hits)
 
     for prompt, params in zip(prompts, sampling_params):
         engine.add_request(prompt, params)
@@ -416,6 +431,9 @@ def main() -> None:
             "moe_int4_backend": args.moe_int4_backend,
             "moe_int4_cta_fanout": args.moe_int4_cta_fanout,
             "moe_int4_fuse_gate_up": not args.no_moe_int4_fuse_gate_up,
+            "moe_int4_fuse_gate_up_silu": not args.no_moe_int4_fuse_silu,
+            "warmup_seqs": args.warmup_seqs,
+            "warmup_prefix_hits": args.warmup_prefix_hits,
             "multi_step_decode": False,
             "num_requests": len(prompts),
             "prompt_tokens": sum(map(len, prompts)),

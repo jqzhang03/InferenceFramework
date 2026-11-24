@@ -407,13 +407,15 @@ class MLAAttention(nn.Module):
                   q_off: torch.Tensor, gather_idx: torch.Tensor
                   ) -> tuple[torch.Tensor, torch.Tensor]:
         dev = k_dense.device
-        R = starts.numel()
         s = starts.long()
         f = qlens.long()
+        seg_len = s + f
         seg_start = torch.cat(
             [torch.zeros(1, dtype=torch.long, device=dev),
-             torch.cumsum(s + f, 0)[:-1]])
-        total = int((s + f).sum().item())
+             torch.cumsum(seg_len, 0)[:-1]])
+        # 唯一一次 host 读：k_out/v_out 的行数。不能从 k_dense.shape[0] 推——decode
+        # 兜底路径 qlens==0、fresh 段为空，行数完全由 starts 决定。
+        total = int(seg_len.sum().item())
         flat = self.mla_cache.reshape(-1, self.mla_cache.shape[-1])
         if self.mla_fp8:
             # fp8 缓存：行 gather + 两段反量化（torch index_select 无 float8）
@@ -427,25 +429,29 @@ class MLAAttention(nn.Module):
         gk_head, gv = self._expand(gc, gk, gc.shape[0])        # 缓存前缀稠密化
         h, dk = gk_head.shape[1], gk_head.shape[2]
         dv = gv.shape[2]
-        k_out = torch.empty(total, h, dk, device=dev, dtype=k_dense.dtype)
-        v_out = torch.empty(total, h, dv, device=dev, dtype=v_dense.dtype)
+        if total == 0:
+            return (torch.empty(0, h, dk, device=dev, dtype=k_dense.dtype),
+                    torch.empty(0, h, dv, device=dev, dtype=v_dense.dtype))
+        if v_dense.shape[0] == 0:
+            # decode 兜底传 [0,1,1] 的空 fresh 段：行不被引用，只需对齐尾维
+            v_dense = gv.new_empty(0, h, dv)
+        # 旧实现逐行 5 次 int()（seg_start/s_cum/q_off/f）→ 每个 cache-shaped
+        # prefill 行每层一次 4B D2H + stream sync（32 行 × 26 层 = 4,160 次，
+        # 实测 310 ms GPU 空转）。这里改成纯 device 端索引：
+        #   行 r 的目标段 = [seg_start[r], +s[r]) 缓存段 + 其后 f[r] 行 fresh 段；
+        #   缓存段源 = s_cum[r] + local（gathered 行主序），
+        #   fresh 段源 = s_total + q_off[r] + (local - s[r])（k_dense 行号）。
+        row = torch.repeat_interleave(torch.arange(seg_len.numel(), device=dev),
+                                      seg_len)
+        local = torch.arange(total, device=dev) - seg_start[row]
         s_cum = torch.cat([torch.zeros(1, dtype=torch.long, device=dev),
                            torch.cumsum(s, 0)])
-        q_starts = q_off.long()
-        if q_starts.numel() != R or f.numel() != R:
-            raise ValueError("MLA cache assembly needs one query start and length per row")
-        for r in range(R):
-            dst = int(seg_start[r])
-            cs, ce = int(s_cum[r]), int(s_cum[r + 1])
-            qs = int(q_starts[r])
-            qe = qs + int(f[r])
-            if ce - cs:
-                k_out[dst:dst + ce - cs] = gk_head[cs:ce]
-                v_out[dst:dst + ce - cs] = gv[cs:ce]
-            if qe - qs:
-                k_out[dst + ce - cs:dst + ce - cs + qe - qs] = k_dense[qs:qe]
-                v_out[dst + ce - cs:dst + ce - cs + qe - qs] = v_dense[qs:qe]
-        return k_out, v_out
+        src = torch.where(local < s[row],
+                          s_cum[row] + local,
+                          s_cum[-1] + q_off.long()[row] + (local - s[row]))
+        k_src = torch.cat([gk_head, k_dense], dim=0)
+        v_src = torch.cat([gv, v_dense], dim=0)
+        return k_src.index_select(0, src), v_src.index_select(0, src)
 
     def _flash(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
                cu_q: torch.Tensor, cu_k: torch.Tensor,

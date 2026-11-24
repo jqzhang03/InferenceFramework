@@ -280,17 +280,22 @@ class MoE(nn.Module):
         The router slots are sorted by expert id once, ``counts``/``offsets``
         stay on the device, and the CUDA extension launches one grid per
         projection, so no route value crosses to the host. GEMV handles 1-4
-        rows per expert; MMA8/16/32 handle 5-8, 9-16, and 17+ rows (MMA32
-        chunks), matching the reference's own dispatch split. Both the GEMV and
-        MMA templates fuse ``silu(gate)*up`` into the kernel, so the intermediate
-        is written once instead of twice plus an elementwise pass. Only chunks
-        above 4096 token rows use ``_forward_compact_host``.
+        rows per expert; one 5-16 row kernel branches to MMA8 or MMA16 from the
+        per-expert count, and MMA32 handles the 17+ rows (chunked). Both the GEMV
+        and MMA templates fuse ``silu(gate)*up`` into the kernel, so the
+        intermediate is written once instead of twice plus an elementwise pass.
+        Only chunks above 4096 token rows use ``_forward_compact_host``.
         """
         T, k = x.size(0), self.top_k
         if T > 4096:
             return self._forward_compact_host(x)
         fanout = self.cta_fanout or (8 if T <= 4 else 128 if T <= 8 else 64)
-        gemv_fanout = fanout if T <= 8 else 8
+        # Decode GEMV is latency-bound at 2.4 waves; both projections use the
+        # full column grid so the memory pipe sees enough independent weight
+        # streams. Prefill keeps the narrow grid because its sparse small-expert
+        # tail is dominated by empty CTAs.
+        gemv_down_fanout = fanout if T <= 8 else (128 if T <= 64 else 8)
+        gemv_gate_fanout = fanout if T <= 8 else (64 if T <= 64 else 8)
         top_vals, top_idx = self._route(x)
         idx_flat = top_idx.reshape(-1)
         if idx_flat.numel() == 0:
@@ -320,19 +325,20 @@ class MoE(nn.Module):
         if not extension.expert_out_compact(
                 padded, tables["gate_w"], tables["gate_s"],
                 tables["up_w"], tables["up_s"], tables["down_w"], tables["down_s"],
-                offsets, counts, hidden, out, gemv_rows, rows, group, gemv_fanout):
+                offsets, counts, hidden, out, gemv_rows, rows, group,
+                gemv_down_fanout, gemv_gate_fanout):
             return None
         ranges = []
         if T >= 5:
-            ranges.append((5, min(8, T), 8))
-        if T >= 9:
-            ranges.append((9, min(16, T), 16))
+            # One count-branched kernel covers the old MMA8 and MMA16 launches.
+            ranges.append((5, min(16, T), 0))
         if T >= 17:
             ranges.append((17, T, 32))
         if ranges:
-            # The reference dispatches 5-8/9-16/17-32 rows to MMA8/16/32. Each
-            # compact range guards its own counts; the <=4-row GEMV result above
-            # stays untouched.
+            # The 5-16 row band is one count-branched launch (MMA8 or MMA16 is
+            # selected inside the kernel); 17+ rows keep the MMA32 chunk walk.
+            # The <=4-row GEMV result above stays untouched, so the three row
+            # classes still cover the decode range disjointly.
             if self.fuse_int4_gate_up_silu:
                 # One buffer for silu(gate)*up: the MMA epilogue applies the
                 # activation, so gate/up are never written back and the
