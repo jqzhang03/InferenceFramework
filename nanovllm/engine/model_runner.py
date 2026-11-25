@@ -8,6 +8,7 @@ from multiprocessing.synchronize import Event
 from multiprocessing.shared_memory import SharedMemory
 
 from nanovllm.config import Config
+from nanovllm.engine.sampling_state import SamplingState
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.registry import get_model_class
 from nanovllm.layers.sampler import Sampler
@@ -75,6 +76,7 @@ class ModelRunner:
             # 加载预训练权重到模型上
             load_model(self.model, config.model)
         self.sampler = Sampler()
+        self.sampling_state: SamplingState | None = None
         # Medusa多头（投机草稿源）：挂在backbone最后一层hidden之后、LM head之前；
         # 权重由 benchmarks/medusa_train.py 自蒸馏训练产出
         if config.speculative == "medusa":
@@ -159,6 +161,8 @@ class ModelRunner:
 
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
+        if self.rank == 0:
+            self.sampling_state = SamplingState(torch.device("cuda", self.device))
 
         if self.world_size > 1:
             # 如果启用了张量并行，rank为0的进程为主进程，创建1MB共享内存用于向worker发布任务
@@ -1408,7 +1412,11 @@ class ModelRunner:
                                        if full_slot_mapping is not None else None))
         return input_ids, positions
 
-    def prepare_sample(self, seqs: list[Sequence]):
+    def prepare_sample(self, seqs: list[Sequence], kind: str | None = None) -> torch.Tensor:
+        if kind is not None and self.sampling_state is not None:
+            varying_rows = kind == "spec" or (kind == "mixed" and self.config.speculative != "none")
+            return self.sampling_state.prepare(seqs, varying_rows=varying_rows)
+        # Startup and standalone probes can sample without enrolling a request.
         # 温度按logits行数展开：普通行每seq 1行；verify行每seq γ+1行（LM head保留全行）
         temperatures = []
         for seq in seqs:
@@ -1725,7 +1733,7 @@ class ModelRunner:
             input_ids, positions = self.prepare_spec(seqs)
         else:
             input_ids, positions = self.prepare_decode(seqs)
-        temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
+        temperatures = self.prepare_sample(seqs, kind) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, kind, return_hidden)
         hidden = None
         if return_hidden:

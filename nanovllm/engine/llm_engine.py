@@ -103,12 +103,14 @@ class LLMEngine:
         if self._pd:
             self.prefill_config.eos = config.eos
             self.decode_config.eos = config.eos
-            self.prefill_scheduler = Scheduler(self.prefill_config)
-            self.decode_scheduler = Scheduler(self.decode_config)
+            self.prefill_scheduler = Scheduler(
+                self.prefill_config, on_request_removed=self.prefill_runner.sampling_state.release)
+            self.decode_scheduler = Scheduler(
+                self.decode_config, on_request_removed=self.decode_runner.sampling_state.release)
             # Keep the familiar attribute for metrics and downstream inspection.
             self.scheduler = self.decode_scheduler
         else:
-            self.scheduler = Scheduler(config)
+            self.scheduler = Scheduler(config, on_request_removed=self.model_runner.sampling_state.release)
         # 基准计时数据：已结束请求的per-request时间戳快照 + 逐step聚合统计
         self._req_metrics: list[dict] = []
         # 已落盘的 seq_id（per-request 记录幂等）：burst 收尾与外层批次可能同时
@@ -201,10 +203,13 @@ class LLMEngine:
             return
         self._exited = True
         if self._pd:
+            self.prefill_scheduler.on_request_removed = None
+            self.decode_scheduler.on_request_removed = None
             self.decode_runner.call("exit")
             self.prefill_runner.call("exit")
             del self.model_runner, self.decode_runner, self.prefill_runner
         else:
+            self.scheduler.on_request_removed = None
             self.model_runner.call("exit")
             del self.model_runner
         for p in self.ps:
@@ -248,7 +253,7 @@ class LLMEngine:
         return seq.seq_id
 
     def cancel_request(self, seq_id: int) -> bool:
-        """Remove a queued/running request and release its KV blocks."""
+        """Remove a queued/running request and release its KV blocks and runner state."""
         schedulers = ((self.prefill_scheduler, self.decode_scheduler) if self._pd
                       else (self.scheduler,))
         for scheduler in schedulers:
@@ -266,6 +271,7 @@ class LLMEngine:
                     scheduler.block_manager.deallocate(seq)
                 if scheduler.full_block_manager is not None and seq.kv_table:
                     scheduler.full_block_manager.deallocate(seq)
+                scheduler.release_request_state(seq_id)
                 seq.status = SequenceStatus.FINISHED
                 seq.t_completed = perf_counter()
                 return True
@@ -655,6 +661,7 @@ class LLMEngine:
 
         self.prefill_scheduler.running.remove(seq)
         self.prefill_scheduler.block_manager.deallocate(seq)
+        self.prefill_scheduler.release_request_state(seq.seq_id)
         seq.num_cached_tokens = cached_tokens
         seq.is_prefill = False
         seq.draft_tokens = None

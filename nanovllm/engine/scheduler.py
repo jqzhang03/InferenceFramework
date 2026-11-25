@@ -1,4 +1,5 @@
 from collections import deque
+from collections.abc import Callable
 from math import ceil
 from time import perf_counter
 
@@ -12,7 +13,9 @@ from nanovllm.engine.ngram import find_ngram_draft
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, *,
+                 on_request_removed: Callable[[int], None] | None = None):
+        self.on_request_removed = on_request_removed
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
@@ -1002,6 +1005,10 @@ class Scheduler:
         self.running.remove(victim)
         self.preempt(victim)
 
+    def release_request_state(self, seq_id: int) -> None:
+        if self.on_request_removed is not None:
+            self.on_request_removed(seq_id)
+
     def preempt(self, seq: Sequence):
         """抢占：KV 块不足时中断序列。
 
@@ -1030,6 +1037,7 @@ class Scheduler:
             if self.full_block_manager is not None and seq.kv_table:
                 self.full_block_manager.deallocate(seq)
             self.waiting.appendleft(seq)
+        self.release_request_state(seq.seq_id)
 
     def swap_out(self, seq: Sequence):
         """KV swap 换出（记账）：记录待拷贝的块与 CPU 缓冲，**不立即释放块**。
@@ -1135,6 +1143,7 @@ class Scheduler:
             if self.full_block_manager is not None and seq.kv_table:
                 self.full_block_manager.deallocate(seq, deferred=True)
             self.running.remove(seq)
+            self.release_request_state(seq.seq_id)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]):
         # 混合批次里prefill与decode序列并存：按各序列的is_prefill（调度器设置）分支
