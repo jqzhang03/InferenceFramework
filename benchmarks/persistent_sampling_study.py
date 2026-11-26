@@ -22,13 +22,13 @@ CASES = (("decode_b1", 1, False), ("decode_b8", 8, False),
          ("decode_b32", 32, False), ("mixed_b8", 8, True))
 
 
-def run_case(engine: LLM, batch: int, churn: bool, seed: int) -> dict:
+def run_case(engine: LLM, batch: int, churn: bool, seed: int, *, input_length: int = 128) -> dict:
     import torch
     from nanovllm import SamplingParams
 
     rng = random.Random(seed)
     num_requests = batch * 6 if churn else batch
-    prompts = [[rng.randrange(100, 10000) for _ in range(128)]
+    prompts = [[rng.randrange(100, 10000) for _ in range(input_length)]
                for _ in range(num_requests)]
     params = [SamplingParams(temperature=(0.55, 0.8, 1.0)[i % 3],
                              max_tokens=16 + i % 17 if churn else 64,

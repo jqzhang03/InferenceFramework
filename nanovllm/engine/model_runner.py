@@ -1,6 +1,7 @@
 import json
 import pickle
 from collections import OrderedDict
+from dataclasses import dataclass
 import torch
 from torch import nn
 import torch.distributed as dist
@@ -17,6 +18,16 @@ from nanovllm.utils.context import (
 )
 from nanovllm.utils.loader import load_model
 from nanovllm.engine.kv_transfer import export_kv_cache, import_kv_cache
+
+
+@dataclass(slots=True)
+class DecodeLookahead:
+    seqs: list[Sequence]
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    context_lens: torch.Tensor
+    slot_mapping: torch.Tensor
+    block_tables: torch.Tensor
 
 
 class ModelRunner:
@@ -163,6 +174,14 @@ class ModelRunner:
         torch.set_default_dtype(default_dtype)
         if self.rank == 0:
             self.sampling_state = SamplingState(torch.device("cuda", self.device))
+        self.decode_lookahead_enabled = (
+            config.decode_lookahead and config.multi_step_decode and config.max_decode_steps > 1
+            and config.execution_mode == "mixed" and self.world_size == 1
+            and config.speculative == "none" and not self._rolling and not self._mla_model)
+        if self.decode_lookahead_enabled:
+            self._decode_host_tokens = torch.empty(
+                config.max_num_seqs, dtype=torch.int64, device="cpu", pin_memory=True)
+            self._decode_tokens_ready = torch.cuda.Event()
 
         if self.world_size > 1:
             # 如果启用了张量并行，rank为0的进程为主进程，创建1MB共享内存用于向worker发布任务
@@ -1425,6 +1444,40 @@ class ModelRunner:
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
         return temperatures
 
+    def prepare_decode_lookahead(
+        self, seqs: list[Sequence], tokens: torch.Tensor,
+    ) -> DecodeLookahead | None:
+        # The current decode already owns its last page for writing. A boundary
+        # or a known completion needs the next scheduler pass to build metadata.
+        positions, slots = [], []
+        for seq in seqs:
+            position = len(seq)
+            offset = position % self.block_size
+            if offset == 0 or seq.num_completion_tokens + 1 >= seq.max_tokens:
+                return None
+            positions.append(position)
+            slots.append(seq.block_table[-1] * self.block_size + offset)
+        lengths = [position + 1 for position in positions]
+        positions_gpu = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        metadata = torch.tensor([lengths, slots], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        context_lens, slot_mapping = metadata.unbind()
+        return DecodeLookahead(seqs, tokens, positions_gpu, context_lens,
+                               slot_mapping, get_context().block_tables)
+
+    def _read_decode_with_lookahead(
+        self, seqs: list[Sequence], tokens: torch.Tensor,
+    ) -> tuple[list[int], DecodeLookahead | None]:
+        host_tokens = self._decode_host_tokens[:len(seqs)]
+        host_tokens.copy_(tokens, non_blocking=True)
+        # Fence only the token readback. Preparing and queuing the next inputs
+        # can run while the current graph and sampler are still executing.
+        self._decode_tokens_ready.record()
+        try:
+            lookahead = self.prepare_decode_lookahead(seqs, tokens)
+        finally:
+            self._decode_tokens_ready.synchronize()
+        return host_tokens.tolist(), lookahead
+
     # 装饰器，该方法在推理模式下使用，禁用梯度计算和额外的梯度计算性能优化
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, kind: str,
@@ -1724,8 +1777,13 @@ class ModelRunner:
 
     # run流程：准备输入、运行模型、采样、返回生成的token id列表
     def run(self, seqs: list[Sequence], kind: str, return_logits: bool = False,
-            return_hidden: bool = False):
-        if kind == "mixed":
+            return_hidden: bool = False, decode_input: DecodeLookahead | None = None,
+            prepare_next_decode: bool = False):
+        if decode_input is not None:
+            input_ids, positions = decode_input.input_ids, decode_input.positions
+            set_context(False, slot_mapping=decode_input.slot_mapping,
+                        context_lens=decode_input.context_lens, block_tables=decode_input.block_tables)
+        elif kind == "mixed":
             input_ids, positions = self.prepare_mixed(seqs)
         elif kind == "prefill":
             input_ids, positions = self.prepare_prefill(seqs)
@@ -1739,8 +1797,13 @@ class ModelRunner:
         if return_hidden:
             logits, hidden = logits
         # 主进程通过采样器从logits中采样得到token id列表
-        token_ids = self.sampler(logits, temperatures).tolist() if self.rank == 0 else None
-        reset_context()
+        try:
+            sampled = self.sampler(logits, temperatures) if self.rank == 0 else None
+            if prepare_next_decode:
+                return self._read_decode_with_lookahead(seqs, sampled)
+            token_ids = sampled.tolist() if sampled is not None else None
+        finally:
+            reset_context()
         if return_logits:
             # 精度检查用：返回本步logits（fp32，driver侧）
             if return_hidden:

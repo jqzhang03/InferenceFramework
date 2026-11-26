@@ -204,6 +204,7 @@ def run_case(style: str, speculative: str, prompts_tok: list[list[int]],
 
                 return diagnostic_run
 
+            llm.model_runner.decode_lookahead_enabled = False
             llm.model_runner.run = record_logits(llm.model_runner.run, llm.config.eos)
         if args.phase_timing:
             def measure(owner, method, name):

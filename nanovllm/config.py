@@ -46,6 +46,7 @@ class Config:
     max_prefill_chunk_tokens: int = 4096 # 自适应调度单步prefill预算上限
     queue_depth_for_full_prefill: int = 16 # 等待队列达到该长度时进入最高队列压力
     multi_step_decode: bool = True # 纯decode时连续复用调度批次；prefill/spec/mixed路径仍单步
+    decode_lookahead: bool = True # 在纯 decode burst 中提前准备下一轮的静态输入
     max_decode_steps: int = 4 # 每个decode调度窗口最多执行的模型前向轮数（含首轮）
     decode_burst_yield: bool = True # burst 提前让出：后续轮开始前检查prefill队列，有等待请求就不再复用余下轮次（False=消融，跑满max_decode_steps再回外循环，会推迟新请求的TTFT；PD模式另有独立prefill队列让出）
     decode_burst_yield_on_arrival: bool = True # burst 期间新请求到达（服务端信号/trace 回调）时也提前收尾：mixed 模式下请求只在两次 step 之间提交，等待队列检查抓不到"正在到达"的请求，需要这个外部压力信号；False=消融

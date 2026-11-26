@@ -16,7 +16,7 @@ from nanovllm.config import Config
 from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.model_runner import DecodeLookahead, ModelRunner
 
 logger = logging.getLogger(__name__)
 
@@ -722,6 +722,7 @@ class LLMEngine:
         *,
         collect_logits: bool,
         yield_for_prefill: bool = False,
+        next_decode: DecodeLookahead | None = None,
     ) -> tuple[int, list[Sequence]]:
         """Run bounded follow-up decode forwards before yielding to the outer loop.
 
@@ -745,7 +746,7 @@ class LLMEngine:
         self._step_stats["decode_bursts"] += 1
         rounds_done = 1  # 首轮已由 schedule() + 本步 run() 完成
 
-        for _ in range(1, self.config.max_decode_steps):
+        for round_index in range(1, self.config.max_decode_steps):
             if not scheduler.running or scheduler.swapped:
                 break
             # 让出检查：decode_burst_yield=False 时故意跳过，继续跑满余下轮次（消融）
@@ -782,7 +783,22 @@ class LLMEngine:
                     transfer_bytes, perf_counter() - transfer_started)
 
             before = {seq.seq_id: seq.num_completion_tokens for seq in seqs}
-            result = runner.call("run", seqs, "decode", collect_logits, False)
+            # Postprocess can remove EOS/finished rows. The scheduler can also
+            # reorder rows or replace pages, so commit preview inputs only after it runs.
+            decode_input = next_decode
+            if (decode_input is not None and (decode_input.seqs != seqs
+                    or scheduler.cow_pairs or scheduler.swap_pairs)):
+                decode_input = None
+            next_decode = None
+            prepare_next = (round_index + 1 < self.config.max_decode_steps
+                            and not collect_logits and runner.decode_lookahead_enabled
+                            and not scheduler.waiting and not scheduler.swapped)
+            if prepare_next:
+                result, next_decode = runner.call("run", seqs, "decode", False, False, decode_input, True)
+            elif decode_input is not None:
+                result = runner.call("run", seqs, "decode", False, False, decode_input)
+            else:
+                result = runner.call("run", seqs, "decode", collect_logits, False)
             if collect_logits:
                 token_ids, logits = result
                 self.collected_logits.append(("decode", logits))
@@ -940,7 +956,12 @@ class LLMEngine:
         run_started = perf_counter()
         collect_logits = (self._collect_logits
                           and (not self._collect_decode_logits_only or kind == "decode"))
-        result = self.model_runner.call("run", seqs, kind, collect_logits, return_hidden)
+        next_decode = None
+        if (kind == "decode" and self.model_runner.decode_lookahead_enabled and not collect_logits
+                and not self.scheduler.waiting and not self.scheduler.swapped):
+            result, next_decode = self.model_runner.call("run", seqs, kind, False, False, None, True)
+        else:
+            result = self.model_runner.call("run", seqs, kind, collect_logits, return_hidden)
         run_elapsed = perf_counter() - run_started
         if kind == "prefill":
             self.scheduler.observe_prefill(
@@ -1005,7 +1026,7 @@ class LLMEngine:
         if kind == "decode":
             n_decode, burst_finished = self._run_decode_burst(
                 self.scheduler, self.model_runner, scheduled_decode_rows,
-                collect_logits=self._collect_logits)
+                collect_logits=self._collect_logits, next_decode=next_decode)
         else:
             burst_finished = []
         # 统计用token数：prefill步为正（prefill token数），decode步为负（序列数），

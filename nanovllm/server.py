@@ -1637,6 +1637,8 @@ def main() -> None:
                         help="estimated per-token latency before request decode samples exist (ms)")
     parser.add_argument("--no-multi-step-decode", action="store_true",
                         help="disable bounded multi-step decode (ablation path)")
+    parser.add_argument("--no-decode-lookahead", action="store_true",
+                        help="prepare each decode round after reading back sampled tokens")
     parser.add_argument("--max-decode-steps", type=int, default=4,
                         help="maximum pure-decode model forwards per engine step")
     parser.add_argument("--no-decode-burst-yield", action="store_true",
@@ -1683,6 +1685,7 @@ def main() -> None:
             "default_tpot_slo_ms": args.default_tpot_slo_ms,
             "tpot_decode_ms_fallback": args.tpot_decode_ms_fallback,
             "multi_step_decode": not args.no_multi_step_decode,
+            "decode_lookahead": not args.no_decode_lookahead,
             "max_decode_steps": args.max_decode_steps,
             "decode_burst_yield": not args.no_decode_burst_yield,
             "decode_burst_yield_on_arrival": not args.no_decode_burst_yield_on_arrival,
