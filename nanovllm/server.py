@@ -1579,6 +1579,10 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--execution-mode", choices=("auto", "mixed", "pd"), default="auto")
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--quantization", choices=("none", "int4", "nvfp4", "mxfp4"), default="none")
+    parser.add_argument("--nvfp4-backend", choices=("software", "cuda", "cublaslt"), default="software")
+    parser.add_argument("--int4-group-size", type=int, default=128)
+    parser.add_argument("--mla-decode-backend", choices=("auto", "cuda", "triton"), default="auto")
     parser.add_argument("--max-model-len", type=int, default=4096)
     parser.add_argument("--gpu-memory-utilization", type=float, default=0.9)
     parser.add_argument("--prefix-cache-max-free-blocks", type=int, default=0,
@@ -1662,6 +1666,10 @@ def main() -> None:
             "cuda_linear_tuning": args.cuda_linear_tuning,
             "execution_mode": args.execution_mode,
             "tensor_parallel_size": args.tensor_parallel_size,
+            "quantization": args.quantization,
+            "nvfp4_backend": args.nvfp4_backend,
+            "int4_group_size": args.int4_group_size,
+            "mla_decode_backend": args.mla_decode_backend,
             "max_model_len": args.max_model_len,
             "gpu_memory_utilization": args.gpu_memory_utilization,
             "prefix_cache_max_free_blocks": args.prefix_cache_max_free_blocks,

@@ -21,7 +21,7 @@ KV cache（引擎 allocate_kv_cache 按 cache_kind="mla" 绑定 fused 张量）�
    逐头稠密 K/V；前缀行从 fused cache gather → kv_b 稠密化 → 行主序组装成
    连续 [Σ(c+f)] 喂 flash_attn_varlen（c = 行 query 起点 = 缓存 token 数）；
 3) decode 行：
-   a) **吸收式 Triton 内核**（kv_b 有 float 视图时默认）：W_UK 吸收进 q
+   a) **吸收式 CUDA / Triton 内核**（kv_b 有 float 视图时）：W_UK 吸收进 q
       （q_abs = q_nope @ W_UKᵀ，score = q_abs·c 的 512 点积）、W_UV 吸收进
       输出侧（kernel 内只累加 [h, kv_lora] 潜在加权和，出内核后一次性 v 投影）
       → 每 token 每层只读 576 元素（GQA 读逐头 K/V 4096 元素）；
@@ -38,6 +38,7 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func
 
+from nanovllm.layers.cuda_mla_decode import cuda_mla_decode_attention
 from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import ColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
@@ -249,6 +250,9 @@ def mla_decode_attention(q_abs: torch.Tensor, q_pe: torch.Tensor,
 class MLAAttention(nn.Module):
     """DeepSeek MLA 注意力层（参数名与 HF checkpoint 直配，loader 零映射）。"""
 
+    _cuda_mla_decode_ext = None
+    _cuda_mla_decode_max_rows = None
+
     cache_kind = "mla"      # 引擎 allocate_kv_cache 识别 fused cache（见 runner）
 
     def __init__(
@@ -336,7 +340,7 @@ class MLAAttention(nn.Module):
         w = getattr(lin, "w_deq", None)
         if w is not None:
             return w
-        if not (lin.int4 or lin.nvfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
+        if not (lin.int4 or lin.nvfp4 or lin.mxfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
             return lin.weight
         return None
 
@@ -621,10 +625,13 @@ class MLAAttention(nn.Module):
         # q_abs = q_nope @ W_UKᵀ → [bs, h, kv_lora]（每步每头 128×512，K=nope）
         q_abs = torch.einsum("bhj,hjk->bhk",
                              q_nope.to(wuk.dtype), wuk).to(torch.float16)
-        o_c = mla_decode_attention(q_abs, q_pe_r.to(torch.float16),
-                                   self.mla_cache, ctx.block_tables,
-                                   ctx.context_lens, self.scaling,
-                                   self.mla_c_scale, self.mla_r_scale)
+        args = (q_abs, q_pe_r.to(torch.float16), self.mla_cache, ctx.block_tables,
+                ctx.context_lens, self.scaling, self.mla_c_scale, self.mla_r_scale)
+        max_rows = self._cuda_mla_decode_max_rows
+        if self._cuda_mla_decode_ext is not None and (max_rows is None or bs <= max_rows):
+            o_c = cuda_mla_decode_attention(*args, self._cuda_mla_decode_ext)
+        else:
+            o_c = mla_decode_attention(*args)
         # v 投影（吸收进输出侧）：o_i = W_UV_i · o_c_i → [bs, h, v_head]
         wuv = self._wuv_t
         out = torch.einsum("bhk,hvk->bhv", o_c.to(wuv.dtype), wuv)

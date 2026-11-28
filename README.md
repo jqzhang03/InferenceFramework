@@ -61,8 +61,8 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 
 * 🚀 **Scheduler** — vLLM-V1-style mixed batches (prefill rows + decode rows sharing one token budget), chunked prefill, bounded multi-step pure decode, TTFT/TPOT-target-aware quotas, spec batches, and KV-swap preemption (bit-exact CPU swap for decode sequences, including FP8 KV byte-preserving offload).
 * 📖 **Paged KV cache** — block size 256; chained-hash **prefix cache** (partial blocks included) with copy-on-write safety, generation-invalidated lazy Top-W scheduling features, and free-block LRU reclamation; **SWA rolling cache** (`rolling_cache=True`, per-sequence ring eviction to window+B — bounded decode KV, Mistral full-window / Gemma-2 local layers) incl. a split dual-pool mode for Gemma-2's alternating local/global windows.
-* ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), Triton GEMMs for w8a8 / int4 / NVFP4 software / fp8 / 2:4-sparse weights, and a cuBLASLt NVFP4 native MMA backend.
-* 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|nvfp4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router**; NVFP4 E2M1/E4M3 block scaling with a Triton software path or native cuBLASLt FP4 MMA on Blackwell; AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill.
+* ⚡ **Kernels** — custom Triton attention kernels for **FP8 KV cache** (paged decode + varlen/verify), CUDA W4A16 GEMV and GEMM for INT4/NVFP4/MXFP4, and a cuBLASLt NVFP4 W4A4 backend.
+* 🎛️ **Weight quantization** — `--quantization none|w8a8|int4|nvfp4|mxfp4|awq|fp8|sparse24`: per-group int8 + SmoothQuant; int4 with an adaptive **dual-path router**; NVFP4 E2M1/E4M3 and MXFP4 E2M1/E8M0 block scaling; AWQ per-layer α search; fp8 via hardware `torch._scaled_mm` on prefill.
 * 🤖 **Speculative decoding** — n-gram, Medusa, EAGLE-1/2/3, DFlash and DSpark. Chain verification uses prefix-reusing varlen prefill; EAGLE-2/3 add batched tree proposal and target-sampled traversal, with EAGLE-3 keeping a paged draft KV; DFlash drafts a block in one forward, and DSpark keeps that parallel backbone but adds a semi-autoregressive Markov head and prunes each request's block by a confidence/survival estimate. `ngram`/`medusa`/`eagle` pure-spec batches use fixed-capacity CUDA Graphs (including FP8 KV); EAGLE-2/3, DFlash, DSpark, MLA and spec-mixed batches fall back to eager. sparse24 keeps its quantized Triton GEMM but uses eager forward because graph replay has produced mismatches in the engine probe. Acceptance preserves the target sampler's distribution.
 * 🧩 **Model zoo** — registry dispatch by `hf_config.model_type`; streaming layer-wise load + quantize-on-load (7B+ on 16GB).
 * 🌐 **Tensor parallelism** — NCCL + shared-memory command channel, `weight_loader`-based sharding.
@@ -77,14 +77,51 @@ A from-scratch, vLLM-style inference engine for offline generation and local onl
 | Llama-3.x | `llama` | incl. `llama3` RoPE scaling |
 | Mistral-7B | `mistral` | sliding-window attention (mask-only by default, optional rolling cache) |
 | Gemma-2 | `gemma2` | alternating local/global windows, attn + final logit soft-cap, embed ×√d, RMSNorm (1+w) |
-| DeepSeek-V2 | `deepseek_v2` | **MLA** (fused latent cache, absorbed-decode Triton kernel, 7.11× KV compression) + MoE with shared experts |
+| DeepSeek-V2 | `deepseek_v2` | **MLA** (fused latent cache, absorbed CUDA or Triton decode, 7.11× KV compression) + MoE with shared experts |
 
 
-Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|awq|fp8|w8a8|sparse24"`,
-`nvfp4_backend="software|cublaslt"`,
+Feature flags (all live on `LLM(...)`): `quantization="int4|nvfp4|mxfp4|awq|fp8|w8a8|sparse24"`,
+`nvfp4_backend="software|cuda|cublaslt"`,
 `kv_cache_dtype="fp8_e4m3"`, `speculative="ngram|medusa|eagle|eagle2|eagle3|dflash|dspark"`, `rolling_cache=True`,
 `kv_swap=True` (default), and `execution_mode="auto|mixed|pd"`. `example.py` is an end-to-end demo; `benchmarks/bench.py` produces
 the full TTFT/TPOT/E2E/p50/p99/SLO report and a JSON artifact under `results/`.
+
+### DeepSeek-V2-Lite 4-bit weights
+
+```python
+from nanovllm import LLM
+
+llm = LLM("/path/to/DeepSeek-V2-Lite", quantization="mxfp4", streaming_load=True)
+# For NVFP4 use quantization="nvfp4", nvfp4_backend="cuda".
+# For INT4 use quantization="int4", int4_group_size=64, moe_int4_backend="compact".
+```
+
+The CUDA FP4 paths use packed E2M1 weights and BF16/FP16 activations, with
+GPU-side expert dispatch at TP=1. MLA keeps the dequantized `kv_b` required
+for absorbed decode. Routers, embeddings, and the default LM head remain in
+the checkpoint dtype. The new CUDA operators need SM80+ and a CUDA toolkit
+to build. The NVFP4 `software` and Blackwell `cublaslt` backends remain selectable.
+
+Use `nanovllm-serve /path/to/DeepSeek-V2-Lite --quantization mxfp4` for HTTP,
+or `--quantization nvfp4 --nvfp4-backend cuda` for NVFP4.
+Run `python -m benchmarks.deepseek_fp4 --graph --output results/deepseek_fp4_run.json`
+for a BF16-referenced quality comparison and matched end-to-end measurements.
+[DeepSeek-V2-Lite comparison](benchmarks/_deepseek_fp4_20261127.md)
+
+DeepSeek-V2-Lite uses native CUDA MLA decode on SM120 for up to 16 decode
+rows when nvcc and Ninja are available. Larger batches select Triton in
+auto mode. The CUDA kernel reads the existing paged cache with
+512 latent and 64 RoPE values per token. It uses Tensor Core products and
+online softmax, with split-KV reduction for longer contexts. BF16, FP16 and
+E4M3 KV caches are supported. CUDA skews the shared Q and KV row strides.
+The SM120 BF16 path also prefetches the next KV tile into registers while
+the current tile runs. [Pipeline measurements](benchmarks/_cuda_mla_pipeline_20261128.md)
+Select `mla_decode_backend="triton"` for the
+Triton path or `"cuda"` to require the CUDA path. The server exposes the
+same setting as `--mla-decode-backend`.
+Run `python -m benchmarks.cuda_mla_decode_study --output results/mla_decode_run.json`
+to compare both operators on the same paged inputs. Add
+`--model /path/to/DeepSeek-V2-Lite` for paired model generation.
 
 Qwen3-0.6B is the only model with in-tree trained drafters in this checkout.
 `ngram` is model-free. `medusa` loads a local head file; `eagle`/`eagle2` share

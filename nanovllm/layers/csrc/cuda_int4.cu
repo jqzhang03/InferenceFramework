@@ -5,6 +5,7 @@
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <cuda_fp8.h>
 #include <algorithm>
 #include <cooperative_groups.h>
 #include <limits>
@@ -30,9 +31,20 @@ struct PackedMatrix {
     const unsigned char* weights;
     const unsigned short* scales;
     int group_size;
+    float tensor_scale = 1.0f;
 };
 
-template <bool BF16>
+template <int FP4_GROUP>
+__device__ float decode_nibble(unsigned code) {
+    if constexpr (FP4_GROUP == 0) return int(code) - 8;
+    // E2M1: exponent zero encodes 0 and 0.5, then binary normals.
+    const unsigned exp = (code >> 1) & 3;
+    const float magnitude = exp == 0 ? (code & 1) * 0.5f
+        : __uint_as_float(((exp + 126) << 23) | ((code & 1) << 22));
+    return (code & 8) ? -magnitude : magnitude;
+}
+
+template <bool BF16, int FP4_GROUP = 0>
 __device__ uint4 dequantize(unsigned packed, float scale) {
     uint4 weights;
     auto* elements = reinterpret_cast<unsigned short*>(&weights);
@@ -42,8 +54,8 @@ __device__ uint4 dequantize(unsigned packed, float scale) {
     // identical to the scalar path.
     #pragma unroll
     for (int i = 0; i < 4; ++i) {
-        const int low = int(packed & 15) - 8;
-        const int high = int((packed >> 4) & 15) - 8;
+        const float low = decode_nibble<FP4_GROUP>(packed & 15);
+        const float high = decode_nibble<FP4_GROUP>((packed >> 4) & 15);
         packed >>= 8;
         const float f0 = low * scale;
         const float f1 = high * scale;
@@ -66,10 +78,24 @@ __device__ unsigned load_packed(PackedMatrix matrix, int col, int k, int kk) {
         matrix.weights + int64_t(col) * (k / 2) + kk / 2);
 }
 
-template <bool BF16>
+template <bool BF16, int FP4_GROUP = 0>
 __device__ float load_scale(PackedMatrix matrix, int col, int k, int kk) {
-    return to_float<BF16>(
-        matrix.scales[int64_t(col) * (k / matrix.group_size) + kk / matrix.group_size]);
+    if constexpr (FP4_GROUP == 0) {
+        return to_float<BF16>(
+            matrix.scales[int64_t(col) * (k / matrix.group_size) + kk / matrix.group_size]);
+    } else {
+        const auto* scales = reinterpret_cast<const uint8_t*>(matrix.scales);
+        const uint8_t scale = scales[int64_t(col) * (k / FP4_GROUP) + kk / FP4_GROUP];
+        if constexpr (FP4_GROUP == 16) {
+            __nv_fp8_e4m3 e4m3;
+            e4m3.__x = scale;
+            return static_cast<float>(e4m3) * matrix.tensor_scale;
+        } else {
+            // Code 0 is 2^-127 (subnormal in FP32), and 255 is NaN.
+            const unsigned fraction = (scale == 0 || scale == 255) ? 0x00400000 : 0;
+            return __uint_as_float((unsigned(scale) << 23) | fraction);
+        }
+    }
 }
 
 template <bool BF16>
@@ -90,7 +116,7 @@ __device__ unsigned short silu_product(float gate, float up) {
     return from_float<BF16>(to_float<BF16>(from_float<BF16>(silu)) * up);
 }
 
-template <bool BF16, int ROWS, bool FUSED>
+template <bool BF16, int ROWS, bool FUSED, int FP4_GROUP = 0>
 __device__ void gemv_columns(const unsigned short* x, PackedMatrix weight, PackedMatrix up,
                              unsigned short* out, int n, int k, int block, int rows) {
     constexpr int lanes = 8;
@@ -105,10 +131,10 @@ __device__ void gemv_columns(const unsigned short* x, PackedMatrix weight, Packe
         float scale = 0.0f, up_scale = 0.0f;
         if (kk < k) {
             packed = load_packed<BF16>(weight, col, k, kk);
-            scale = load_scale<BF16>(weight, col, k, kk);
+            scale = load_scale<BF16, FP4_GROUP>(weight, col, k, kk);
             if constexpr (FUSED) {
                 up_packed = load_packed<BF16>(up, col, k, kk);
-                up_scale = load_scale<BF16>(up, col, k, kk);
+                up_scale = load_scale<BF16, FP4_GROUP>(up, col, k, kk);
             }
         }
         for (; kk < k; kk += stride) {
@@ -119,15 +145,15 @@ __device__ void gemv_columns(const unsigned short* x, PackedMatrix weight, Packe
             float next_scale = 0.0f, next_up_scale = 0.0f;
             if (next < k) {
                 next_packed = load_packed<BF16>(weight, col, k, next);
-                next_scale = load_scale<BF16>(weight, col, k, next);
+                next_scale = load_scale<BF16, FP4_GROUP>(weight, col, k, next);
                 if constexpr (FUSED) {
                     next_up_packed = load_packed<BF16>(up, col, k, next);
-                    next_up_scale = load_scale<BF16>(up, col, k, next);
+                    next_up_scale = load_scale<BF16, FP4_GROUP>(up, col, k, next);
                 }
             }
-            uint4 w = dequantize<BF16>(packed, scale);
+            uint4 w = dequantize<BF16, FP4_GROUP>(packed, scale);
             uint4 u;
-            if constexpr (FUSED) u = dequantize<BF16>(up_packed, up_scale);
+            if constexpr (FUSED) u = dequantize<BF16, FP4_GROUP>(up_packed, up_scale);
             const auto* weights = reinterpret_cast<const unsigned short*>(&w);
             const auto* up_weights = reinterpret_cast<const unsigned short*>(&u);
             #pragma unroll
@@ -286,11 +312,11 @@ __device__ int swizzled(int row, int k) {
 // and `warps / col_groups` row groups. The output tile is block_n channels x
 // BLOCK_M rows either way; a wider CTA amortises the weight dequantisation over
 // more rows, and a narrower one keeps more CTAs resident.
-template <bool BF16, int BLOCK_M, int THREADS>
+template <bool BF16, int BLOCK_M, int THREADS, int FP4_GROUP = 0>
 __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
                          const unsigned short* scales, unsigned short* out,
                          int m, int n, int k, int group_size, int m0, int n0,
-                         unsigned short* tile) {
+                         unsigned short* tile, float tensor_scale = 1.0f) {
     constexpr int warps = THREADS / 32;
     constexpr int col_groups = block_n / 16;
     constexpr int row_groups = warps / col_groups;
@@ -303,7 +329,7 @@ __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
     const int lane = threadIdx.x % 32, warp = threadIdx.x / 32;
     const int col_group = warp % col_groups;
     const int row_offset = (warp / col_groups) * rows_per_warp;
-    const int groups = k / group_size;
+    const PackedMatrix matrix{weights, scales, group_size, tensor_scale};
     float accum[row_tiles][4] = {};
 
     for (int k0 = 0; k0 < k; k0 += block_k) {
@@ -313,10 +339,9 @@ __device__ void mma_tile(const unsigned short* x, const unsigned char* weights,
             const int channel = n0 + row, kk = k0 + col;
             uint4 values = {};
             if (channel < n && kk < k) {
-                unsigned packed = *reinterpret_cast<const unsigned*>(
-                    weights + int64_t(channel) * (k / 2) + kk / 2);
-                float scale = to_float<BF16>(scales[int64_t(channel) * groups + kk / group_size]);
-                values = dequantize<BF16>(packed, scale);
+                const unsigned packed = load_packed<BF16>(matrix, channel, k, kk);
+                const float scale = load_scale<BF16, FP4_GROUP>(matrix, channel, k, kk);
+                values = dequantize<BF16, FP4_GROUP>(packed, scale);
             }
             *reinterpret_cast<uint4*>(tile + swizzled(row, col)) = values;
         }
@@ -896,6 +921,171 @@ PackedMatrix checked_matrix(const at::Tensor& x, const at::Tensor& packed,
                 "W4A16 requires aligned activations and packed weights");
     return {reinterpret_cast<const unsigned char*>(packed.data_ptr()),
             reinterpret_cast<const unsigned short*>(scales.data_ptr()), group};
+}
+
+template <bool BF16, int GROUP>
+__device__ void fp4_gemv(const unsigned short* x, PackedMatrix matrix, unsigned short* out,
+                         int rows, int n, int k, int tile) {
+    switch (rows) {
+        case 1: gemv_columns<BF16, 1, false, GROUP>(x, matrix, {}, out, n, k, tile, 1); break;
+        case 2: gemv_columns<BF16, 2, false, GROUP>(x, matrix, {}, out, n, k, tile, 2); break;
+        case 3: gemv_columns<BF16, 3, false, GROUP>(x, matrix, {}, out, n, k, tile, 3); break;
+        case 4: gemv_columns<BF16, 4, false, GROUP>(x, matrix, {}, out, n, k, tile, 4); break;
+    }
+}
+
+template <bool BF16, int GROUP>
+__global__ void fp4_gemv_kernel(const unsigned short* x, PackedMatrix matrix, const float* scale,
+                                unsigned short* out, int m, int n, int k) {
+    if constexpr (GROUP == 16) matrix.tensor_scale = *scale;
+    fp4_gemv<BF16, GROUP>(x, matrix, out, m, n, k, blockIdx.x);
+}
+
+template <bool BF16, int GROUP, int BLOCK_M, int THREADS>
+__global__ void fp4_mma_kernel(const unsigned short* x, PackedMatrix matrix, const float* scale,
+                               unsigned short* out, int m, int n, int k, int n_tiles) {
+    __shared__ __align__(16) unsigned short tile[(block_n + BLOCK_M) * block_k];
+    if constexpr (GROUP == 16) matrix.tensor_scale = *scale;
+    mma_tile<BF16, BLOCK_M, THREADS, GROUP>(
+        x, matrix.weights, matrix.scales, out, m, n, k, GROUP,
+        (blockIdx.x / n_tiles) * BLOCK_M, (blockIdx.x % n_tiles) * block_n,
+        tile, matrix.tensor_scale);
+}
+
+template <bool BF16, int GROUP>
+__global__ void fp4_grouped_kernel(const unsigned short* x, const int64_t* table,
+        const int* offsets, const int* counts, unsigned short* out, int n, int k) {
+    constexpr int block_m = 16;
+    __shared__ __align__(16) unsigned short tile[(block_n + block_m) * block_k];
+    const int expert = blockIdx.x;
+    const int rows = counts[expert];
+    if (!rows) return;
+    const int64_t offset = offsets[expert];
+    const int experts = gridDim.x;
+    PackedMatrix matrix{reinterpret_cast<const uint8_t*>(table[expert]),
+                        reinterpret_cast<const unsigned short*>(table[experts + expert]), GROUP};
+    if constexpr (GROUP == 16) {
+        matrix.tensor_scale = *reinterpret_cast<const float*>(table[2 * experts + expert]);
+    }
+    if (rows <= 4) {
+        if (blockIdx.y != 0) return;
+        for (int col = blockIdx.z * 16; col < n; col += gridDim.z * 16) {
+            fp4_gemv<BF16, GROUP>(x + offset * k, matrix, out + offset * n,
+                                  rows, n, k, col / 16);
+        }
+        return;
+    }
+    for (int start = blockIdx.y * block_m; start < rows; start += gridDim.y * block_m) {
+        for (int col = blockIdx.z * block_n; col < n; col += gridDim.z * block_n) {
+            mma_tile<BF16, block_m, 128, GROUP>(
+                x + offset * k, matrix.weights, matrix.scales, out + offset * n,
+                rows, n, k, GROUP, start, col, tile, matrix.tensor_scale);
+        }
+    }
+}
+
+template <bool BF16, int GROUP>
+void launch_fp4(const unsigned short* x, PackedMatrix matrix, const float* scale,
+                unsigned short* out, int m, int n, int k, cudaStream_t stream) {
+    if (m <= 4) {
+        fp4_gemv_kernel<BF16, GROUP><<<(n - 1) / 16 + 1, 128, 0, stream>>>(
+            x, matrix, scale, out, m, n, k);
+        return;
+    }
+    const int tiles = (n - 1) / block_n + 1;
+    const int64_t grid = int64_t(tiles) * ((m - 1) / (m <= 64 ? 16 : 32) + 1);
+    TORCH_CHECK(grid <= std::numeric_limits<int>::max(), "FP4 W4A16 grid is too large");
+    if (m <= 64) {
+        fp4_mma_kernel<BF16, GROUP, 16, 128><<<grid, 128, 0, stream>>>(
+            x, matrix, scale, out, m, n, k, tiles);
+    } else {
+        fp4_mma_kernel<BF16, GROUP, 32, 128><<<grid, 128, 0, stream>>>(
+            x, matrix, scale, out, m, n, k, tiles);
+    }
+}
+
+void check_fp4_io(const at::Tensor& x, const at::Tensor& out, int64_t group) {
+    TORCH_CHECK(group == 16 || group == 32, "FP4 W4A16 group must be 16 or 32");
+    TORCH_CHECK(x.is_cuda() && out.device() == x.device() &&
+                x.dim() == 2 && out.dim() == 2 && x.is_contiguous() && out.is_contiguous() &&
+                (x.scalar_type() == at::kHalf || x.scalar_type() == at::kBFloat16) &&
+                out.scalar_type() == x.scalar_type() && x.size(0) == out.size(0) &&
+                x.size(1) > 0 && x.size(1) % group == 0 &&
+                std::max({x.size(0), x.size(1), out.size(1)}) <=
+                    std::numeric_limits<int>::max() - block_k &&
+                reinterpret_cast<uintptr_t>(x.data_ptr()) % 16 == 0, "invalid FP4 W4A16 I/O");
+}
+
+void fp4_gemm_out(const at::Tensor& x, const at::Tensor& packed, const at::Tensor& scales,
+                  const at::Tensor& scale, at::Tensor& out, int64_t group) {
+    check_fp4_io(x, out, group);
+    const int m = x.size(0), n = out.size(1), k = x.size(1);
+    TORCH_CHECK(packed.device() == x.device() && scales.device() == x.device() &&
+                packed.scalar_type() == at::kByte &&
+                scales.scalar_type() == (group == 16 ? at::kFloat8_e4m3fn : at::kByte) &&
+                packed.is_contiguous() && scales.is_contiguous() &&
+                packed.sizes() == at::IntArrayRef({n, k / 2}) &&
+                scales.sizes() == at::IntArrayRef({n, k / group}) &&
+                reinterpret_cast<uintptr_t>(packed.data_ptr()) % 4 == 0,
+                "invalid packed FP4 weight or block scales");
+    if (group == 16) {
+        TORCH_CHECK(scale.device() == x.device() && scale.scalar_type() == at::kFloat &&
+                    scale.numel() == 1, "NVFP4 requires a FP32 tensor scale");
+    }
+    if (!m || !n) return;
+    const c10::cuda::CUDAGuard guard(x.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+    const auto* a = reinterpret_cast<const unsigned short*>(x.data_ptr());
+    auto* c = reinterpret_cast<unsigned short*>(out.data_ptr());
+    const PackedMatrix matrix{packed.data_ptr<uint8_t>(),
+                              reinterpret_cast<const unsigned short*>(scales.data_ptr()), int(group)};
+    const auto* global = group == 16 ? scale.data_ptr<float>() : nullptr;
+    if (x.scalar_type() == at::kBFloat16) {
+        if (group == 16) launch_fp4<true, 16>(a, matrix, global, c, m, n, k, stream);
+        else launch_fp4<true, 32>(a, matrix, global, c, m, n, k, stream);
+    } else {
+        if (group == 16) launch_fp4<false, 16>(a, matrix, global, c, m, n, k, stream);
+        else launch_fp4<false, 32>(a, matrix, global, c, m, n, k, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+template <bool BF16, int GROUP>
+void launch_fp4_grouped(const at::Tensor& x, const at::Tensor& table, const at::Tensor& offsets,
+                        const at::Tensor& counts, at::Tensor& out, int max_rows, cudaStream_t stream) {
+    const int n = out.size(1);
+    const int fanout = max_rows <= 4 ? 8 : max_rows <= 64 ? 32 : 16;
+    const dim3 grid(counts.numel(), std::min(4, (max_rows - 1) / 16 + 1),
+                    std::min(fanout, (n - 1) / 16 + 1));
+    fp4_grouped_kernel<BF16, GROUP><<<grid, 128, 0, stream>>>(
+        reinterpret_cast<const unsigned short*>(x.data_ptr()), table.data_ptr<int64_t>(),
+        offsets.data_ptr<int>(), counts.data_ptr<int>(),
+        reinterpret_cast<unsigned short*>(out.data_ptr()), n, x.size(1));
+}
+
+// The pointer table and segment descriptors are produced by the MoE dispatcher.
+void fp4_grouped_out(const at::Tensor& x, const at::Tensor& table, const at::Tensor& offsets,
+                     const at::Tensor& counts, at::Tensor& out, int64_t group, int64_t max_rows) {
+    check_fp4_io(x, out, group);
+    for (const auto* t : {&table, &offsets, &counts}) {
+        TORCH_CHECK(t->device() == x.device() && t->is_contiguous(), "invalid FP4 routing device");
+    }
+    TORCH_CHECK(counts.dim() == 1 && offsets.sizes() == counts.sizes() &&
+                offsets.scalar_type() == at::kInt && counts.scalar_type() == at::kInt &&
+                table.scalar_type() == at::kLong &&
+                table.sizes() == at::IntArrayRef({group == 16 ? 3 : 2, counts.numel()}) &&
+                max_rows > 0 && max_rows <= x.size(0), "invalid FP4 routing shapes");
+    if (!counts.numel() || !out.size(1)) return;
+    const c10::cuda::CUDAGuard guard(x.device());
+    const auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
+    if (x.scalar_type() == at::kBFloat16) {
+        if (group == 16) launch_fp4_grouped<true, 16>(x, table, offsets, counts, out, max_rows, stream);
+        else launch_fp4_grouped<true, 32>(x, table, offsets, counts, out, max_rows, stream);
+    } else {
+        if (group == 16) launch_fp4_grouped<false, 16>(x, table, offsets, counts, out, max_rows, stream);
+        else launch_fp4_grouped<false, 32>(x, table, offsets, counts, out, max_rows, stream);
+    }
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void gemm_out(const at::Tensor& x, const at::Tensor& packed, const at::Tensor& scales,
@@ -1559,6 +1749,8 @@ bool expert_out(const at::Tensor& x, const at::Tensor& gate_weight, const at::Te
 }  // namespace
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
+    module.def("fp4_gemm_out", &fp4_gemm_out, "Packed NVFP4/MXFP4 W4A16 GEMM");
+    module.def("fp4_grouped_out", &fp4_grouped_out, "Segmented NVFP4/MXFP4 expert GEMM");
     module.def("gemm_out", &gemm_out, "Fused packed-INT4 x FP16/BF16 GEMM");
     module.def("gemm_out_variant", &gemm_out_variant,
                "Diagnostic packed-INT4 GEMM with an explicit MMA tile variant");

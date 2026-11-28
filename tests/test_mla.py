@@ -166,6 +166,8 @@ def test_mla_cache_assemble_matches_row_loop():
     cfg = _toy_cfg()
     m = DeepseekV2ForCausalLM(cfg)
     attn = m.model.layers[0].self_attn
+    with torch.no_grad():
+        attn.kv_b_proj.weight.uniform_(-0.05, 0.05)
     blocks, block_size = 8, 16
     dim = attn.kv_lora_rank + attn.qk_rope_head_dim
     attn.mla_cache = torch.randn(blocks, block_size, dim)

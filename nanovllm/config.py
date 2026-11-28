@@ -56,8 +56,8 @@ class Config:
     rolling_cache: bool = False # SWA 滚动缓冲：Mistral 使用统一环池；Gemma-2 交替 local/global 层使用环池+full 双池。两者支持 auto/fp8_e4m3 KV、权重量化、KV swap 和 decode/mixed CUDA Graph；sparse24 权重量化保留但 CUDA Graph 自动回退 eager。rolling+Medusa/EAGLE 与 Gemma-2 split+speculative 暂不支持。滚动模型不参与前缀缓存发布/消费（窗口内容过期，重复 prompt 有代价，见 block_manager.py 头注）；仅对具有 sliding-window 语义的 Mistral/Gemma-2 生效。
     num_ring_kvcache_blocks: int = 0  # split 模式：环池块数（runner 分配后写回，scheduler 建 BM 用）
     num_full_kvcache_blocks: int = 0  # split 模式：full 池块数（同上）
-    quantization: str = "none" # 权重量化："none" | "w8a8" | "int4" | "nvfp4"（E2M1 + E4M3块缩放）| "awq" | "sparse24" | "fp8"
-    nvfp4_backend: str = "software" # NVFP4矩阵乘：software(Triton BF16 dot) | cublaslt(动态量化激活 + 原生FP4 MMA)
+    quantization: str = "none" # "none" | "w8a8" | "int4" | "nvfp4" | "mxfp4" | "awq" | "sparse24" | "fp8"
+    nvfp4_backend: str = "software" # Triton W4A16 | CUDA W4A16 | cuBLASLt W4A4
     awq_scales_path: str = "" # AWQ激活感知缩放文件（.pt，benchmarks/awq_calibrate.py真实文本校准产出）；为空时用随机token内联校准
     quantize_lm_head: bool = False # 是否量化LM head（默认不量化——与w8a8一致：logits由lm_head点积直接决定，量化它精度损失最大，见INTERVIEW.md §10.3.6）
     int4_dense_path: bool = True # int4双路径模式（默认开）：大M prefill/decode 与小N层走 w_deq 稠密反量化（cuBLAS，收掉大M亏损与TTFT回归），小M大N层走int4内核；代价是显存 1.73GB（比fp16的1.50还大）。False=纯int4（0.85GB，大batch慢），见INTERVIEW.md §10.3.6。streaming 模式下自动强制 False（w_deq 全尺寸副本与按层加载目的冲突；MLA kv_b 例外保留反量化副本）
@@ -88,8 +88,11 @@ class Config:
 
     int4_kernel_backend: str | None = None # None selects the model default for packed W4A16 GEMM
     cuda_int4_expert_fusion: str = "none" # none | gate_up | full (cooperative launch)
+    mla_decode_backend: str = "auto" # auto | cuda | triton
 
     def __post_init__(self):
+        assert self.mla_decode_backend in ("auto", "cuda", "triton"), \
+            f"unknown MLA decode backend: {self.mla_decode_backend!r}"
         assert self.linear_backend in (None, "torch", "cuda", "cuda_auto", "cuda_fp8", "cuda_fp8_auto", "cuda_decode", "cuda_decode_auto")
         if self.linear_backend is not None and self.linear_backend.endswith("auto"):
             assert self.cuda_linear_tuning, "auto CUDA linear requires a frozen cuda_linear_tuning report"
@@ -154,7 +157,7 @@ class Config:
                 "当前 PD KV 传输暂要求 kv_cache_dtype='auto'"
         assert self.speculative in ("none", "ngram", "medusa", "eagle", "eagle2", "eagle3", "dflash", "dspark"), \
             f"unknown speculative: {self.speculative}"
-        assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "awq", "sparse24", "fp8"), \
+        assert self.quantization in ("none", "w8a8", "int4", "nvfp4", "mxfp4", "awq", "sparse24", "fp8"), \
             f"unknown quantization: {self.quantization}"
         assert self.moe_int4_backend in ("loop", "segment", "compact"), \
             f"unknown MoE INT4 backend: {self.moe_int4_backend!r}"
@@ -164,11 +167,11 @@ class Config:
             f"unknown INT4 kernel backend: {self.int4_kernel_backend!r}"
         assert self.cuda_int4_expert_fusion in ("none", "gate_up", "full"), \
             f"unknown CUDA INT4 expert fusion: {self.cuda_int4_expert_fusion!r}"
-        assert self.nvfp4_backend in ("software", "cublaslt"), \
+        assert self.nvfp4_backend in ("software", "cuda", "cublaslt"), \
             f"unknown NVFP4 backend: {self.nvfp4_backend}"
-        if self.nvfp4_backend == "cublaslt":
+        if self.nvfp4_backend != "software":
             assert self.quantization == "nvfp4", \
-                "nvfp4_backend='cublaslt' requires quantization='nvfp4'"
+                f"nvfp4_backend={self.nvfp4_backend!r} requires quantization='nvfp4'"
         if self.speculative == "medusa":
             assert self.medusa_path, "speculative=medusa requires medusa_path"
         if self.speculative in ("eagle", "eagle2", "eagle3"):

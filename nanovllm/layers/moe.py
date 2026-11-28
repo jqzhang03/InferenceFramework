@@ -116,6 +116,12 @@ class MoE(nn.Module):
         self._int4_segment_reason = None
         self._int4_segment_tables = None
         self._int4_segment_signature = None
+        self._cuda_fp4_tables = None
+
+    def _apply(self, fn, recurse=True):
+        # The device tables contain raw addresses into the expert buffers.
+        self._cuda_fp4_tables = None
+        return super()._apply(fn, recurse=recurse)
 
     def _route(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """fp32 路由：返回 (topk 概率 [T,k]（x dtype，含 routed_scaling_factor）, 专家号 [T,k])。"""
@@ -138,7 +144,7 @@ class MoE(nn.Module):
         w = getattr(lin, "w_deq", None)
         if w is not None:
             return w
-        if not (lin.int4 or lin.nvfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
+        if not (lin.int4 or lin.nvfp4 or lin.mxfp4 or lin.fp8 or lin.w8a8 or lin.sparse24):
             return lin.weight
         return None
 
@@ -163,6 +169,8 @@ class MoE(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """自动后端：float 权重可组 → grouped 批量 GEMM；否则逐专家循环。"""
+        if self._cuda_fp4_tables is not None and x.size(0):
+            return self._forward_cuda_fp4(x)
         if self._ensure_grouped_weights():
             return self._forward_grouped(x)
         if self.int4_backend == "compact" and self._can_compact_int4(x):
@@ -178,6 +186,74 @@ class MoE(nn.Module):
             (expert.gate_proj, expert.up_proj, expert.down_proj)
             for expert in self.experts
         ]
+
+    def prepare_cuda_fp4(self, quantization: str) -> None:
+        """Build expert pointer tables before warmup and graph capture."""
+        from nanovllm.layers.cuda_int4 import load_cuda_int4
+        from nanovllm.layers.linear import MXFP4_GROUP_SIZE, NVFP4_GROUP_SIZE
+
+        self._cuda_fp4_tables = None
+        linears = self._expert_linears()
+        for triple in linears:
+            for linear in triple:
+                if (linear.tp_size != 1 or linear.bias is not None or hasattr(linear, "w_deq")
+                        or not getattr(linear, quantization, False)):
+                    return
+                if quantization == "nvfp4" and linear.nvfp4_backend != "cuda":
+                    return
+        attrs = [f"w_{quantization}", f"w_{quantization}_scale"]
+        if quantization == "nvfp4":
+            attrs.append("w_nvfp4_global_scale")
+        device = getattr(linears[0][0], attrs[0]).device
+        self._cuda_fp4_group = MXFP4_GROUP_SIZE if quantization == "mxfp4" else NVFP4_GROUP_SIZE
+        self._cuda_fp4_extension = load_cuda_int4(device)
+        self._cuda_fp4_tables = tuple(
+            torch.tensor([[getattr(linear, attr).data_ptr() for linear in projection]
+                          for attr in attrs], device=device, dtype=torch.int64)
+            for projection in zip(*linears)
+        )
+
+    def _forward_cuda_fp4(self, x: torch.Tensor) -> torch.Tensor:
+        top_vals, top_idx = self._route(x)
+        packed, order, counts, offsets = self._pack_expert_rows(x, top_idx)
+        gate = x.new_empty((packed.size(0), self.moe_intermediate_size))
+        up = torch.empty_like(gate)
+        out = x.new_empty((packed.size(0), self.hidden_size))
+        gate_table, up_table, down_table = self._cuda_fp4_tables
+        project = self._cuda_fp4_extension.fp4_grouped_out
+        group, max_rows = self._cuda_fp4_group, x.size(0)
+        project(packed, gate_table, offsets, counts, gate, group, max_rows)
+        project(packed, up_table, offsets, counts, up, group, max_rows)
+        hidden = F.silu(gate) * up
+        project(hidden, down_table, offsets, counts, out, group, max_rows)
+        return self._merge_expert_rows(x, out, order, top_vals, top_idx)
+
+    def _pack_expert_rows(self, x: torch.Tensor, top_idx: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        idx_flat = top_idx.reshape(-1)
+        target = torch.arange(x.size(0), device=x.device).repeat_interleave(self.top_k)
+        order = torch.argsort(idx_flat, stable=True)
+        sorted_idx = idx_flat[order]
+        # A fixed-size histogram avoids synchronizing on the largest expert ID.
+        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
+        counts.index_add_(0, sorted_idx, torch.ones_like(sorted_idx, dtype=torch.int32))
+        offsets = torch.cumsum(counts, 0, dtype=torch.int32) - counts
+        return x.index_select(0, target[order]), order, counts, offsets
+
+    def _merge_expert_rows(self, x: torch.Tensor, ys: torch.Tensor, order: torch.Tensor,
+                           top_vals: torch.Tensor, top_idx: torch.Tensor) -> torch.Tensor:
+        T, k = x.size(0), self.top_k
+        rows = ys.size(0)
+        inverse = torch.empty_like(order)
+        inverse[order] = torch.arange(rows, device=x.device)
+        y_by_slot = ys[inverse].view(T, k, self.hidden_size)
+        slot_order = top_idx.argsort(dim=-1, stable=True)
+        y_expert_order = y_by_slot.gather(
+            1, slot_order[:, :, None].expand(T, k, self.hidden_size))
+        weights_expert_order = top_vals.gather(1, slot_order)
+        result = torch.zeros_like(x)
+        for slot in range(k):
+            result += y_expert_order[:, slot, :] * weights_expert_order[:, slot, None]
+        return result
 
     def _can_segment_int4(self, x: torch.Tensor) -> bool:
         """Check the supported packed-INT4 layout once after model quantization."""
@@ -286,7 +362,7 @@ class MoE(nn.Module):
         intermediate is written once instead of twice plus an elementwise pass.
         Only chunks above 4096 token rows use ``_forward_compact_host``.
         """
-        T, k = x.size(0), self.top_k
+        T = x.size(0)
         if T > 4096:
             return self._forward_compact_host(x)
         fanout = self.cta_fanout or (8 if T <= 4 else 128 if T <= 8 else 64)
@@ -297,19 +373,9 @@ class MoE(nn.Module):
         gemv_down_fanout = fanout if T <= 8 else (128 if T <= 64 else 8)
         gemv_gate_fanout = fanout if T <= 8 else (64 if T <= 64 else 8)
         top_vals, top_idx = self._route(x)
-        idx_flat = top_idx.reshape(-1)
-        if idx_flat.numel() == 0:
+        if top_idx.numel() == 0:
             return torch.zeros_like(x)
-        target = torch.arange(T, device=x.device).repeat_interleave(k)
-        order = torch.argsort(idx_flat, stable=True)
-        sorted_idx = idx_flat[order]
-        # bincount sizes its output from the input maximum and therefore syncs;
-        # index_add_ over a fixed-size histogram keeps the whole route pass on
-        # the device.
-        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
-        counts.index_add_(0, sorted_idx, torch.ones_like(sorted_idx, dtype=torch.int32))
-        offsets = torch.cumsum(counts, 0, dtype=torch.int32) - counts
-        packed = x.index_select(0, target[order])
+        packed, order, counts, offsets = self._pack_expert_rows(x, top_idx)
         rows = packed.size(0)
         rows_cap = (1 if T <= 1 else 2 if T <= 2 else 4 if T <= 4
                     else 8 if T <= 8 else 16 if T <= 16 else 32)
@@ -361,18 +427,7 @@ class MoE(nn.Module):
                 extension.gemm_out_compact(
                     hidden, tables["down_w"], tables["down_s"], offsets, counts,
                     out, T, rows, group, fanout, block_m, lo, hi)
-        ys = out[:rows]
-        inverse = torch.empty_like(order)
-        inverse[order] = torch.arange(rows, device=x.device)
-        y_by_slot = ys[inverse].view(T, k, self.hidden_size)
-        slot_order = top_idx.argsort(dim=-1, stable=True)
-        y_expert_order = y_by_slot.gather(
-            1, slot_order[:, :, None].expand(T, k, self.hidden_size))
-        weights_expert_order = top_vals.gather(1, slot_order)
-        result = torch.zeros_like(x)
-        for slot in range(k):
-            result += y_expert_order[:, slot, :] * weights_expert_order[:, slot, None]
-        return result
+        return self._merge_expert_rows(x, out[:rows], order, top_vals, top_idx)
 
     def _ensure_int4_segment_tables(self, x: torch.Tensor) -> dict[str, torch.Tensor]:
         linears = self._expert_linears()

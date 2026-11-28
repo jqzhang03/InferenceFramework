@@ -133,8 +133,9 @@ class ModelRunner:
                 self.calibrate_and_quantize_w8a8()
             elif config.quantization == "int4":
                 self.quantize_int4_weights()
-            elif config.quantization == "nvfp4":
-                self.quantize_nvfp4_weights()
+            elif config.quantization in ("nvfp4", "mxfp4"):
+                for m in self._quant_mods():
+                    self._quantize_fp4(m)
             elif config.quantization == "awq":
                 self.quantize_awq_weights()
             elif config.quantization == "sparse24":
@@ -149,6 +150,11 @@ class ModelRunner:
         if config.int4_kernel_backend == "cuda":
             from nanovllm.layers.cuda_int4 import install_cuda_int4
             self.cuda_int4_count = install_cuda_int4(self.model, config.cuda_int4_expert_fusion)
+        if config.quantization == "mxfp4" or config.nvfp4_backend == "cuda":
+            from nanovllm.layers.moe import MoE
+            for module in self.model.modules():
+                if isinstance(module, MoE):
+                    module.prepare_cuda_fp4(config.quantization)
         self._finalize_mla_mode()   # MLA 模型模式收尾（decode 内核 vs 稠密兜底）
         self._finalize_rolling()    # SWA 滚动缓冲（mistral 校验 + 层标记）
         self.warmup_model()
@@ -432,17 +438,13 @@ class ModelRunner:
             dp = self.config.int4_dense_path or getattr(m, "is_mla_kv_b", False)
             m.quantize_int4(dense_path=dp, group_size=self.config.int4_group_size)
 
-    def quantize_nvfp4_weights(self):
-        """NVFP4 E2M1 weights with 16-value E4M3 block scales.
-
-        MLA ``kv_b`` retains its small dequantized view for absorbed decode; all
-        other linears stay packed and use the configured NVFP4 GEMM backend.
-        """
-        for m in self._quant_mods():
-            m.quantize_nvfp4(
-                keep_dense=getattr(m, "is_mla_kv_b", False),
-                backend=self.config.nvfp4_backend,
-            )
+    def _quantize_fp4(self, module: nn.Module) -> None:
+        # MLA's absorbed decode reads a dequantized view of kv_b.
+        keep_dense = getattr(module, "is_mla_kv_b", False)
+        if self.config.quantization == "mxfp4":
+            module.quantize_mxfp4(keep_dense=keep_dense)
+        else:
+            module.quantize_nvfp4(keep_dense=keep_dense, backend=self.config.nvfp4_backend)
 
     def quantize_fp8_weights(self):
         """FP8(e4m3) 全量化（per-column 权重 + per-token 激活，vLLM 同款方案）。
@@ -591,17 +593,19 @@ class ModelRunner:
 
         def hook(chunk: nn.Module, chunk_path: str):
             for name, m in chunk.named_modules():
+                if getattr(m, "quantize_exclude", False):
+                    continue
                 full = f"{chunk_path}.{name}" if name else chunk_path
                 if isinstance(m, ParallelLMHead):
                     # 与 eager 的 _quant_mods 同规则：默认不量化；tie 绑定时跳过
                     if self.config.quantize_lm_head and not self.config.hf_config.tie_word_embeddings:
-                        if q in ("int4", "nvfp4", "awq", "sparse24", "fp8"):
+                        if q in ("int4", "nvfp4", "mxfp4", "awq", "sparse24", "fp8"):
                             if q == "sparse24":
                                 m.quantize_sparse24()
                             elif q == "fp8":
                                 m.quantize_fp8()
-                            elif q == "nvfp4":
-                                m.quantize_nvfp4(backend=self.config.nvfp4_backend)
+                            elif q in ("nvfp4", "mxfp4"):
+                                self._quantize_fp4(m)
                             else:
                                 s = awq_scales.get(full) if awq_scales is not None else None
                                 m.quantize_int4(s, dense_path=dp, group_size=self.config.int4_group_size)
@@ -615,11 +619,8 @@ class ModelRunner:
                     m.quantize_int4(awq_scales.get(full) if awq_scales is not None else None,
                                     group_size=self.config.int4_group_size,
                                     dense_path=dp or kvb)
-                elif q == "nvfp4":
-                    m.quantize_nvfp4(
-                        keep_dense=kvb,
-                        backend=self.config.nvfp4_backend,
-                    )
+                elif q in ("nvfp4", "mxfp4"):
+                    self._quantize_fp4(m)
                 elif q == "awq":
                     assert awq_scales is not None and full in awq_scales, \
                         f"awq scale missing for {full}"
@@ -775,6 +776,25 @@ class ModelRunner:
         assert self._mla_modules, "kv_lora_rank 配置但找不到 MLA 注意力层"
         self._mla_dense_decode = any(
             not m.has_float_views() for m in self._mla_modules)
+        backend = self.config.mla_decode_backend
+        if backend != "triton":
+            from nanovllm.layers.cuda_mla_decode import CUDA_MLA_AUTO_MAX_ROWS, load_cuda_mla_decode
+
+            compatible = not self._mla_dense_decode and (
+                self.config.kv_cache_dtype == "fp8_e4m3" or
+                hf.dtype in (torch.bfloat16, torch.float16)) and all(
+                (m.num_heads, m.kv_lora_rank, m.qk_rope_head_dim) == (16, 512, 64)
+                for m in self._mla_modules)
+            if not compatible and backend == "cuda":
+                raise ValueError("CUDA MLA decode requires a floating kv_b view, a BF16/FP16/E4M3 "
+                                 "KV cache, and the 16-head DeepSeek-V2-Lite MLA layout")
+            if compatible:
+                extension = load_cuda_mla_decode(torch.device("cuda", self.device),
+                                                 required=backend == "cuda")
+                for module in self._mla_modules:
+                    module._cuda_mla_decode_ext = extension
+                    module._cuda_mla_decode_max_rows = (
+                        CUDA_MLA_AUTO_MAX_ROWS if backend == "auto" else None)
         if self._mla_dense_decode and not self.enforce_eager:
             print("[mla] kv_b 无 float 视图（纯 int4/fp8 等）→ decode 走稠密兜底 "
                   "（逐层缓存稠密化）；动态形状必须 eager → 强制 enforce_eager",

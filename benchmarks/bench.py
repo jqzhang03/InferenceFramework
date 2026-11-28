@@ -729,12 +729,11 @@ def parse_args():
                    help="FP8 KV校准最大值的scale安全因子；小于1会增加饱和裁剪")
     p.add_argument("--quantization", default="none",
                    help="权重量化: none | w8a8(int8, Triton GEMM) | int4(per-group int4, Triton GEMM) | "
-                        "nvfp4(E2M1 + E4M3 scales; software or native cuBLASLt MMA) | "
+                        "nvfp4(E2M1 + E4M3) | mxfp4(E2M1 + E8M0; CUDA W4A16) | "
                         "awq(int4+激活感知缩放) | sparse24(2:4结构化剪枝, Triton稀疏GEMM) | "
                         "fp8(e4m3全量化: per-column权重+per-token激活, Triton内核+硬件FP8 MMA)")
-    p.add_argument("--nvfp4-backend", choices=("software", "cublaslt"), default="software",
-                   help="NVFP4 GEMM backend; cublaslt dynamically quantizes activations and "
-                        "requires Blackwell native FP4 MMA")
+    p.add_argument("--nvfp4-backend", choices=("software", "cuda", "cublaslt"), default="software",
+                   help="NVFP4 GEMM backend: Triton W4A16, CUDA W4A16, or Blackwell cuBLASLt W4A4")
     p.add_argument("--awq-scales-path", default="",
                    help="AWQ缩放文件（benchmarks/awq_calibrate.py产出）；空=随机token内联校准")
     p.add_argument("--quantize-lm-head", action="store_true",

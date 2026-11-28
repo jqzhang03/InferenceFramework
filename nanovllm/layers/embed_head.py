@@ -81,6 +81,8 @@ class ParallelLMHead(WeightQuantMixin, VocabParallelEmbedding):
             logits = self._sparse24_forward(x)
         elif self.int4:
             logits = self._int4_forward(x)
+        elif self.mxfp4:
+            logits = self._fp4_forward(x)
         elif self.nvfp4:
             logits = self._nvfp4_forward(x)
         else:

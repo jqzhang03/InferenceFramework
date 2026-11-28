@@ -1,4 +1,4 @@
-"""Native GEMM for the existing offset-encoded INT4 weight buffers."""
+"""Native W4A16 operators for packed INT4 and FP4 weights."""
 from functools import lru_cache
 import os
 from pathlib import Path
@@ -51,6 +51,19 @@ def cuda_int4_gemm(x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
         return out
     from nanovllm.layers.linear import int4_gemm
     return int4_gemm(x, packed, scales)
+
+
+def cuda_fp4_gemm(x: torch.Tensor, packed: torch.Tensor, scales: torch.Tensor,
+                  tensor_scale: torch.Tensor | None, group: int) -> torch.Tensor:
+    """Multiply BF16/FP16 activations by packed E2M1 weights."""
+    x = x.contiguous()
+    if x.data_ptr() % 16:
+        x = x.clone()
+    out = x.new_empty((x.size(0), packed.size(0)))
+    extension = load_cuda_int4(x.device)
+    extension.fp4_gemm_out(x, packed, scales,
+                           scales if tensor_scale is None else tensor_scale, out, group)
+    return out
 
 
 def set_cuda_int4_expert_fusion(model: torch.nn.Module, fusion: str) -> int:
